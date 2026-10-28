@@ -1,4 +1,4 @@
-# dsh-plugin-soulbridge
+﻿# dsh-plugin-soulbridge
 
 **Spike**（0.0.1）：验证 DSH 插件能否给 soulbridge 提供两个确定能力——系统提示注入、会话事件观察。
 
@@ -52,3 +52,40 @@ npm uninstall dsh-plugin-soulbridge
 - DSH 是 nightly（本机 `version` 文件为 44.7.0），插件 API 可能已漂移
 - 首次加载失败时，DSH 可能只打一条警告；先看 `plugin.log` 再看应用日志
 - 本包是 ESM + 纯 JS，无构建步骤；正式版应改为 TypeScript 并加类型
+
+## 实测记录（2026-10-28，本机 nightly 44.7.0）
+
+**不需要重启**：修改 profile 的 `package.json` 后，应用自己热加载了插件（`apply()` 在配置写入后立即被调用）。
+
+已确认：
+
+| 项 | 结果 |
+|---|---|
+| `systemPrompt.section` | 注册成功，`text()` 每次 assembly 重算（日志中两次求值） |
+| 注入生效 | 标记文本出现在模型系统提示中 |
+| `session/event` | 收到 `assistant/message`、`tool/call`、`tool/result`、`step/start`、`step/end`、`system/message`、`job/registered` |
+| `ctx.effect` | 注册成功，disposer 尚未触发 |
+| `user/message` | **未观测到**（本轮用户消息早于监听器注册），待下一轮确认 |
+
+payload 形状（data 的 key）：
+
+```
+assistant/message  turn, step, message, usage, stream
+tool/call          turn, step, callId, name, arguments
+tool/result        turn, step, message, meta
+```
+
+`session` 对象暴露 `eventsSnapshot` / `log` / `header` / `contextFold` / `toolHistoryProjection`，可绕过事件直接读快照。
+
+## 安装备注
+
+`dsh plugin --profile desktop add <path>` 在本机失败：`~/.dsh` 是指向 `D:\DSH\home` 的目录联接，pnpm 的 store 与 virtual-store 路径解析不一致（`ERR_PNPM_UNEXPECTED_STORE` / `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`）。
+
+改为零包管理器安装：
+
+```powershell
+New-Item -ItemType Junction -Path "D:\DSH\home\profiles\desktop\node_modules\dsh-plugin-soulbridge" -Target "D:\git-workspace\repos\dsh-plugin-soulbridge"
+# 再把 "dsh-plugin-soulbridge" 加进 package.json 的 dsh.profile.bundles
+```
+
+卸载用 `scripts/rollback.ps1`。
