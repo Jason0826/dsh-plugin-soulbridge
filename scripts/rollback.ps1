@@ -1,5 +1,6 @@
-# 回滚插件安装：删除目录联接、从 bundles 里摘掉、可选恢复 package.json 备份。
-# 用法：pwsh -File rollback.ps1 [-RestoreBackup <package.json.bak-...>]
+# Roll back the plugin install: remove the junction, drop the bundle entry, and
+# optionally restore a package.json backup.
+# Usage: powershell -File rollback.ps1 [-RestoreBackup <package.json.bak-...>]
 param(
   [string]$Profile = 'D:\DSH\home\profiles\desktop',
   [string]$Package = 'dsh-plugin-soulbridge',
