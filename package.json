@@ -1,6 +1,6 @@
 {
     "name":  "dsh-plugin-soulbridge",
-    "version":  "0.0.3",
+    "version":  "0.0.4",
     "description":  "Spike: inject soulbridge context into DSH sessions and log session events.",
     "type":  "module",
     "main":  "index.js",

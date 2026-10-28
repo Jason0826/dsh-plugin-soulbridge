@@ -141,8 +141,9 @@ export function apply(ctx) {
       const text = textOf(data.content);
       log(`user/message source=${kind ?? '?'} chars=${text.length}`);
 
-      // Injected/plugin messages are not the user speaking.
-      if (kind && kind !== 'user') return;
+      // Only the human's own prose. runtime-context / time-context / injected
+      // messages arrive with their own source kinds and must not be observed.
+      if (kind !== 'user') return;
       if (text.length === 0) return;
       void observeText(text);
     });
