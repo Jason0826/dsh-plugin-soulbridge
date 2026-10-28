@@ -1,4 +1,4 @@
-﻿# dsh-plugin-soulbridge
+# dsh-plugin-soulbridge
 
 **Spike**（0.0.1）：验证 DSH 插件能否给 soulbridge 提供两个确定能力——系统提示注入、会话事件观察。
 
