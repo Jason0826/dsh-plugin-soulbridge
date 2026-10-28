@@ -89,3 +89,16 @@ New-Item -ItemType Junction -Path "D:\DSH\home\profiles\desktop\node_modules\dsh
 ```
 
 卸载用 `scripts/rollback.ps1`。
+
+## 事故记录：manifest BOM 导致启动崩溃
+
+2026-10-28，安装本插件时手工编辑了 profile 的 `package.json`。Windows PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写入 UTF-8 BOM，而 desktop host 的 `readProfileManifest` 直接 `JSON.parse`，不剥 BOM：
+
+```
+DesktopHostFatalError: Unexpected token '﻿', "﻿{" is not valid JSON
+  at readProfileManifest (.../dsh-app-boot/lib/index.js:913)
+```
+
+结果：应用启动即崩溃，需要手工改回无 BOM 才能恢复。
+
+**此后所有 manifest 写入必须走 `scripts/profile-manifest.ps1`**（`UTF8Encoding(false)` + 写后校验），不要再用 `Set-Content` / `Out-File`。
