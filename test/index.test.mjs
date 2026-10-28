@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, MARKER, textOf, VERSION } = await import('../index.js');
+const { apply, name, inject, textOf, VERSION } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -54,7 +54,9 @@ test('registers section, listener and effect', () => {
     ['section', 'soulbridge', 10],
     ['on', 'session/event'],
   ]);
-  assert.equal(harness.section.text(), MARKER);
+  const injected = harness.section.text();
+  assert.match(injected, /<soul /, '注入的是 core 生成的真实上下文');
+  assert.ok(!injected.includes('spike'), '占位标记已被替换');
 });
 
 test('section text is dynamic (evaluated per assembly)', () => {
@@ -121,4 +123,4 @@ test('a broken service does not stop the other registrations', () => {
   assert.match(log, /effect registration failed: no effect/);
 });
 
-test.after(() => rmSync(home, { recursive: true, force: true }));
+test.after(() => { try { rmSync(home, { recursive: true, force: true }); } catch { /* Windows keeps SQLite handles open */ } });

@@ -1,34 +1,110 @@
 /**
- * dsh-plugin-soulbridge — spike v0.0.2.
+ * dsh-plugin-soulbridge — DSH adapter for the soulbridge personality layer.
  *
- * Now does the real thing for one path: when a user message lands in the
- * session event stream, hand its text to soulbridge's `observe`.
+ * Division of labour (ADR 0024): core owns state and wording; this plugin owns
+ * timing. It does three things and nothing else:
+ *   1. puts core's context text into the system prompt (verb 1)
+ *   2. hands every human message to observe() (verb 2)
+ *   3. records a heartbeat so "is it working?" is answerable without log spelunking
  *
- * Still deliberately small:
- *   - injection is a static marker (memory injection comes next)
- *   - only `user/message` events are acted on
- *   - every failure is logged, never thrown (the host must not break)
- *
- * Log: ~/.soulbridge/plugin.log (override with SOULBRIDGE_HOME).
+ * Every failure degrades: the host must never break because this plugin is
+ * unhappy. What was injected, observed, or skipped is written to
+ * ~/.soulbridge/plugin-state.json.
  */
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { openSqlite, ensureConfig, resolveDbPath, Soul } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
 export const inject = ['systemPrompt'];
 
-const LOG_DIR = process.env.SOULBRIDGE_HOME ?? join(homedir(), '.soulbridge');
-/** Read the version instead of hardcoding it; a stale label made debugging harder. */
+const HOME = process.env.SOULBRIDGE_HOME ?? join(homedir(), '.soulbridge');
 const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
-const MARKER = '<soulbridge>spike: plugin loaded, injection works</soulbridge>';
+const STATE_FILE = join(HOME, 'plugin-state.json');
+
+/** Injection policy: what may reach the prompt, and how much of it. */
+const INJECT = {
+  types: ['strategy', 'fact', 'trait'],
+  minImportance: 6,
+  maxItems: 5,
+};
+/** Prompt assembly can run several times per step; do not hit SQLite every time. */
+const CACHE_MS = 30_000;
 
 function log(line) {
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    appendFileSync(join(LOG_DIR, 'plugin.log'), `${new Date().toISOString()} ${line}\n`);
+    mkdirSync(HOME, { recursive: true });
+    appendFileSync(join(HOME, 'plugin.log'), `${new Date().toISOString()} ${line}\n`);
   } catch {
     // Logging must never break the host.
+  }
+}
+
+function readState() {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeState(patch) {
+  try {
+    mkdirSync(HOME, { recursive: true });
+    const next = { ...readState(), ...patch, version: VERSION, updatedAt: Date.now() };
+    writeFileSync(STATE_FILE, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    log(`state write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+let soul = null;
+let soulError = null;
+
+/** Open the soul once. Throws only the first time; callers degrade to no injection. */
+function ensureSoul() {
+  if (soul) return soul;
+  if (soulError) throw soulError;
+  try {
+    const config = ensureConfig();
+    soul = new Soul({
+      store: openSqlite(resolveDbPath()),
+      soulId: config.soulId,
+      userId: config.userId,
+      name: config.name,
+      deviceId: config.deviceId,
+    });
+    log(`soul ready: db=${resolveDbPath()} soul=${config.soulId} user=${config.userId}`);
+    writeState({ appliedAt: readState().appliedAt ?? Date.now(), soulId: config.soulId, userId: config.userId });
+    return soul;
+  } catch (error) {
+    soulError = error instanceof Error ? error : new Error(String(error));
+    log(`soul init failed: ${soulError.message}`);
+    writeState({ lastError: `soul init failed: ${soulError.message}` });
+    throw soulError;
+  }
+}
+
+let cache = { text: '', at: 0 };
+
+/** Synchronous by necessity: PromptSection.text cannot return a promise. */
+function buildInjection() {
+  const now = Date.now();
+  if (now - cache.at < CACHE_MS) return cache.text;
+  try {
+    const result = ensureSoul().context({ track: false, ...INJECT });
+    cache = { text: result.text, at: now };
+    const state = readState();
+    writeState({
+      injects: (state.injects ?? 0) + 1,
+      lastInjectAt: now,
+      lastInjectedChars: result.text.length,
+      lastInjectedMemories: result.used.length,
+    });
+    return cache.text;
+  } catch {
+    return cache.text;
   }
 }
 
@@ -52,59 +128,50 @@ function textOf(content) {
     .trim();
 }
 
-let soulPromise = null;
-
-/** Lazily open the soul; returns null (and logs) when anything is unavailable. */
-function getSoul() {
-  if (soulPromise === null) {
-    soulPromise = (async () => {
-      const core = await import('soulbridge');
-      const config = core.ensureConfig();
-      const dbPath = core.resolveDbPath();
-      const store = core.openSqlite(dbPath);
-      const soul = new core.Soul({
-        store,
-        soulId: config.soulId,
-        userId: config.userId,
-        name: config.name,
-        deviceId: config.deviceId,
-      });
-      log(`soul ready: db=${dbPath} soul=${config.soulId} user=${config.userId}`);
-      return soul;
-    })().catch((error) => {
-      log(`soul init failed: ${error instanceof Error ? error.message : String(error)}`);
-      soulPromise = null;
-      return null;
-    });
-  }
-  return soulPromise;
-}
-
 async function observeText(text) {
   const started = Date.now();
   try {
-    const soul = await getSoul();
-    if (!soul) return;
-    const result = await soul.observe({ role: 'user', content: text });
+    const result = await ensureSoul().observe({ role: 'user', content: text });
     const affect = result?.affect ?? {};
+    const state = readState();
+    writeState({
+      observes: (state.observes ?? 0) + 1,
+      lastObserveAt: started,
+      lastObservedChars: text.length,
+      lastWritten: result?.written ?? 0,
+      lastAffect: affect.dominant ?? null,
+    });
     log(
       `observe ok: chars=${text.length} written=${result?.written ?? '?'}` +
-        ` affect=${affect.dominant ?? 'none'} intensity=${affect.intensity ?? '?'}` +
-        ` confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
+        ` affect=${affect.dominant ?? 'none'} confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
     );
+    cache.at = 0; // a new observation may change what should be injected
   } catch (error) {
-    log(`observe failed: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    const state = readState();
+    writeState({ observeFails: (state.observeFails ?? 0) + 1, lastError: `observe failed: ${message}` });
+    log(`observe failed: ${message}`);
   }
 }
 
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
+  writeState({ appliedAt: Date.now(), version: VERSION });
 
   try {
     ctx.effect(
       () => {
         log('effect registered');
-        return () => log('effect disposed');
+        return () => {
+          try {
+            soul?.store?.close();
+            soul = null;
+            cache = { text: '', at: 0 };
+            log('effect disposed (store closed)');
+          } catch (error) {
+            log(`dispose failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        };
       },
       'soulbridge.lifecycle',
     );
@@ -116,10 +183,7 @@ export function apply(ctx) {
     ctx.systemPrompt.section({
       name: 'soulbridge',
       order: 10,
-      text: () => {
-        log('section.text() evaluated');
-        return MARKER;
-      },
+      text: () => buildInjection(),
     });
     log('section registered (name=soulbridge order=10)');
   } catch (error) {
@@ -155,4 +219,4 @@ export function apply(ctx) {
   }
 }
 
-export { MARKER, textOf, VERSION };
+export { textOf, VERSION };
