@@ -1,0 +1,30 @@
+{
+  "name": "dsh-plugin-soulbridge",
+  "version": "0.0.1",
+  "description": "Spike: inject soulbridge context into DSH sessions and log session events.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "soulbridge"
+  ],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

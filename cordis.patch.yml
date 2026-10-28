@@ -1,0 +1,5 @@
+# Bundle layer: mount the soulbridge plugin (dsh-plugin-soulbridge → index.js).
+# The profile's own cordis.patch.yml remains the user's patch layer.
+- insert:
+    - id: soulbridge
+      name: 'dsh-plugin-soulbridge'
