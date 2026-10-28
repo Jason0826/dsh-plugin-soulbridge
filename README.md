@@ -1,104 +1,73 @@
 # dsh-plugin-soulbridge
 
-**Spike**（0.0.1）：验证 DSH 插件能否给 soulbridge 提供两个确定能力——系统提示注入、会话事件观察。
+把 [soulbridge](https://github.com/Jason0826/soulbridge) 接到 DSH 上的宿主适配器。
 
-不碰记忆库、不调 core、不写任何用户数据。目的只有一个：**拿到运行时证据**。
+soulbridge 的核心不知道 DSH 的存在；这个包只做**接线**：在正确的时机调用四个动词，
+把结果放进系统提示，并在失败时安静降级（[ADR 0024](https://github.com/Jason0826/soulbridge/blob/main/docs/adr/0024-adapters.md)）。
 
 ## 它做什么
 
-| 挂载点 | 行为 | 日志 |
+| 时机 | 调用 | 现状 |
 |---|---|---|
-| `ctx.systemPrompt.section` | 注册 `name: soulbridge`、`order: 10` 的常驻段，文本为一行标记 | `section registered` / `section.text() evaluated` |
-| `ctx.on('session/event')` | 记录事件类型与 payload 的 key 列表 | `session/event type=… dataKeys=[…]` |
-| `ctx.effect` | 注册卸载清理 | `effect registered` / `effect disposed` |
+| 提示组装 | `context({ track: false })` → 注入 `<soul>` / `<style>` / `<affect>` / `<memories>` | 🚧 目前是占位标记 |
+| 每条**用户**消息 | `observe(turn)` → 写记忆 + 情绪采样 | ✅ 已实现 |
+| 会话结束 | `reflect(turns)` | 🚧 未接 |
+| 模型主动查询 | `recall` / `remember` 工具 | 🚧 未接 |
 
-日志位置：`~/.soulbridge/plugin.log`（可用 `SOULBRIDGE_HOME` 覆盖）。
+**不会做**：改变事实判断、编造记忆、把个人记忆写进项目文件。
 
-**只记 key，不记内容**——第一轮不采集任何对话文本。
+日志：`~/.soulbridge/plugin.log`（`SOULBRIDGE_HOME` 可覆盖）。数据落在 `~/.soulbridge/soul.db`，
+与 CLI 和任何其他工具共享同一个库。
 
-## 安装
-
-```powershell
-# 1. 装进 DSH 的 desktop profile
-cd $env:USERPROFILE\.dsh\profiles\desktop
-npm install "D:\git-workspace\repos\dsh-plugin-soulbridge"
-
-# 2. 把包加进 bundles（编辑 package.json）
-#    "dsh": { "profile": { "bundles": [ …, "dsh-plugin-soulbridge" ] } }
-```
-
-然后**重启 DSH**。
-
-## 卸载
+## 安装（正式发版前，走 git 标签）
 
 ```powershell
 cd $env:USERPROFILE\.dsh\profiles\desktop
-npm uninstall dsh-plugin-soulbridge
-# 同时从 package.json 的 dsh.profile.bundles 里删掉它
+dsh plugin --profile desktop add "github:Jason0826/dsh-plugin-soulbridge#v0.0.4"
 ```
+
+然后确认它出现在 `package.json` 的 `dsh.profile.bundles` 里，重启 DSH。
+
+> `dsh plugin add` 会调用 pnpm；如果提示 store / virtual-store 不一致，见文末「已知问题」。
+
+## 依赖
+
+| 包 | 版本 | 说明 |
+|---|---|---|
+| `soulbridge` | `^0.0.6` | 从 npm 安装，是第一个暴露库入口（`main`/`exports`）的版本 |
 
 ## 判读日志
 
 | 日志 | 含义 |
 |---|---|
-| `apply() called` | 插件被加载了 |
+| `apply() called (v0.0.2)` | 插件被加载（标签是历史遗留，不代表版本号） |
 | `section registered` + `section.text() evaluated` | 注入通路成立 |
-| `session/event type=user/message dataKeys=[…]` | 事件通路成立，且能看到用户消息的字段 |
-| `effect disposed` | 卸载时清理正常 |
-| 完全没有 `apply() called` | 插件没被加载（bundles 或依赖没配对） |
+| `user/message source=user chars=N` | 收到用户消息 |
+| `soul ready: db=… soul=… user=…` | core 与数据库就绪 |
+| `observe ok: chars=… written=… affect=… confidence=…` | **整条链路成功** |
+| `skipping profile bundle …` (stderr) | bundle 被启动器跳过，原因就在后面 |
 
-## 已知风险
-
-- DSH 是 nightly（本机 `version` 文件为 44.7.0），插件 API 可能已漂移
-- 首次加载失败时，DSH 可能只打一条警告；先看 `plugin.log` 再看应用日志
-- 本包是 ESM + 纯 JS，无构建步骤；正式版应改为 TypeScript 并加类型
-
-## 实测记录（2026-10-28，本机 nightly 44.7.0）
-
-**不需要重启**：修改 profile 的 `package.json` 后，应用自己热加载了插件（`apply()` 在配置写入后立即被调用）。
-
-已确认：
-
-| 项 | 结果 |
-|---|---|
-| `systemPrompt.section` | 注册成功，`text()` 每次 assembly 重算（日志中两次求值） |
-| 注入生效 | 标记文本出现在模型系统提示中 |
-| `session/event` | 收到 `assistant/message`、`tool/call`、`tool/result`、`step/start`、`step/end`、`system/message`、`job/registered` |
-| `ctx.effect` | 注册成功，disposer 尚未触发 |
-| `user/message` | **未观测到**（本轮用户消息早于监听器注册），待下一轮确认 |
-
-payload 形状（data 的 key）：
-
-```
-assistant/message  turn, step, message, usage, stream
-tool/call          turn, step, callId, name, arguments
-tool/result        turn, step, message, meta
-```
-
-`session` 对象暴露 `eventsSnapshot` / `log` / `header` / `contextFold` / `toolHistoryProjection`，可绕过事件直接读快照。
-
-## 安装备注
-
-`dsh plugin --profile desktop add <path>` 在本机失败：`~/.dsh` 是指向 `D:\DSH\home` 的目录联接，pnpm 的 store 与 virtual-store 路径解析不一致（`ERR_PNPM_UNEXPECTED_STORE` / `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`）。
-
-改为零包管理器安装：
+## 卸载
 
 ```powershell
-New-Item -ItemType Junction -Path "D:\DSH\home\profiles\desktop\node_modules\dsh-plugin-soulbridge" -Target "D:\git-workspace\repos\dsh-plugin-soulbridge"
-# 再把 "dsh-plugin-soulbridge" 加进 package.json 的 dsh.profile.bundles
+cd $env:USERPROFILE\.dsh\profiles\desktop
+node "…/pnpm.mjs" remove dsh-plugin-soulbridge
+# 或 dsh plugin --profile desktop remove dsh-plugin-soulbridge
 ```
 
-卸载用 `scripts/rollback.ps1`。
+再从 `dsh.profile.bundles` 里删掉 `dsh-plugin-soulbridge`，重启。
 
-## 事故记录：manifest BOM 导致启动崩溃
+## 已知问题
 
-2026-10-28，安装本插件时手工编辑了 profile 的 `package.json`。Windows PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写入 UTF-8 BOM，而 desktop host 的 `readProfileManifest` 直接 `JSON.parse`，不剥 BOM：
+### `dsh plugin add` 报 store / virtual-store 不一致
 
-```
-DesktopHostFatalError: Unexpected token '﻿', "﻿{" is not valid JSON
-  at readProfileManifest (.../dsh-app-boot/lib/index.js:913)
-```
+`~/.dsh` 若是指向另一块盘的目录联接，而 profile 的 `node_modules` 是在联接建立**之前**创建的，
+pnpm 会同时报 `ERR_PNPM_UNEXPECTED_STORE` 和 `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`。
 
-结果：应用启动即崩溃，需要手工改回无 BOM 才能恢复。
+修复：在**真实路径**下重装一次依赖，让 `.modules.yaml` 记录的路径与 pnpm 的解析一致。
 
-**此后所有 manifest 写入必须走 `scripts/profile-manifest.ps1`**（`UTF8Encoding(false)` + 写后校验），不要再用 `Set-Content` / `Out-File`。
+### profile 的 `package.json` 带 BOM 会让应用起不来
+
+DSH 启动器对 `package.json` 直接 `JSON.parse`，不剥 BOM。用 Windows PowerShell 的
+`Set-Content -Encoding utf8` 改它会写入 BOM，导致启动崩溃或 bundle 被静默跳过。
+本仓库用 `scripts/profile-manifest.ps1` 改写清单，用 `scripts/check-encodings.ps1` 检查编码。
