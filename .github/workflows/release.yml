@@ -1,0 +1,39 @@
+name: release
+
+# Publishing is triggered by a version tag: pushing v0.0.4 publishes to npm.
+# Authentication is npm Trusted Publishing (GitHub OIDC); no NPM_TOKEN.
+# Prerequisite, configured once on npmjs.com:
+#   Package settings -> Trusted publishing -> GitHub Actions
+#   Repository: Jason0826/dsh-plugin-soulbridge
+#   Workflow filename: release.yml
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC: lets npm verify the publish came from this repository
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Verify the tarball contents
+        run: npm pack --dry-run
+
+      - name: Publish
+        run: npm publish --access public --provenance
