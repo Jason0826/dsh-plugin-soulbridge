@@ -12,7 +12,7 @@ const { apply, name, inject, textOf, VERSION } = await import('../index.js');
 function fakeCtx() {
   const calls = [];
   let section;
-  let listener;
+  const listeners = {};
   let disposer;
   const ctx = {
     effect(fn, label) {
@@ -28,11 +28,18 @@ function fakeCtx() {
     },
     on(event, fn) {
       calls.push(['on', event]);
-      listener = fn;
+      listeners[event] = fn;
       return () => {};
     },
   };
-  return { ctx, calls, get section() { return section; }, get listener() { return listener; }, get disposer() { return disposer; } };
+  return {
+    ctx,
+    calls,
+    get section() { return section; },
+    get listener() { return listeners['session/event']; },
+    get disposeListener() { return listeners['session/disposed']; },
+    get disposer() { return disposer; },
+  };
 }
 
 test('VERSION 与 package.json 同步', async () => {
@@ -53,6 +60,7 @@ test('registers section, listener and effect', () => {
     ['effect', 'soulbridge.lifecycle'],
     ['section', 'soulbridge', 10],
     ['on', 'session/event'],
+    ['on', 'session/disposed'],
   ]);
   const injected = harness.section.text();
   assert.match(injected, /<soul /, '注入的是 core 生成的真实上下文');
