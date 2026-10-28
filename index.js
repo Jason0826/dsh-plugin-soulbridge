@@ -1,16 +1,15 @@
 /**
- * dsh-plugin-soulbridge — spike.
+ * dsh-plugin-soulbridge — spike v0.0.2.
  *
- * Goal of this iteration is evidence, not features:
- *   1. does `systemPrompt.section` get registered and evaluated?
- *   2. does `session/event` reach us, and what does its payload look like?
- *   3. is the lifecycle disposer called on unload?
+ * Now does the real thing for one path: when a user message lands in the
+ * session event stream, hand its text to soulbridge's `observe`.
  *
- * Everything is appended to `~/.soulbridge/plugin.log` (override with
- * SOULBRIDGE_HOME). Registration is individually guarded so one failure still
- * leaves the other evidence behind.
+ * Still deliberately small:
+ *   - injection is a static marker (memory injection comes next)
+ *   - only `user/message` events are acted on
+ *   - every failure is logged, never thrown (the host must not break)
  *
- * No database access, no core import yet: fewer moving parts, clearer signal.
+ * Log: ~/.soulbridge/plugin.log (override with SOULBRIDGE_HOME).
  */
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -40,8 +39,64 @@ function safeKeys(value) {
   }
 }
 
+/** UserMessage.content is a ContentBlock[]; only text blocks are user prose. */
+function textOf(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+    .trim();
+}
+
+let soulPromise = null;
+
+/** Lazily open the soul; returns null (and logs) when anything is unavailable. */
+function getSoul() {
+  if (soulPromise === null) {
+    soulPromise = (async () => {
+      const core = await import('soulbridge');
+      const config = core.ensureConfig();
+      const dbPath = core.resolveDbPath();
+      const store = core.openSqlite(dbPath);
+      const soul = new core.Soul({
+        store,
+        soulId: config.soulId,
+        userId: config.userId,
+        name: config.name,
+        deviceId: config.deviceId,
+      });
+      log(`soul ready: db=${dbPath} soul=${config.soulId} user=${config.userId}`);
+      return soul;
+    })().catch((error) => {
+      log(`soul init failed: ${error instanceof Error ? error.message : String(error)}`);
+      soulPromise = null;
+      return null;
+    });
+  }
+  return soulPromise;
+}
+
+async function observeText(text) {
+  const started = Date.now();
+  try {
+    const soul = await getSoul();
+    if (!soul) return;
+    const result = await soul.observe({ role: 'user', content: text });
+    const affect = result?.affect ?? {};
+    log(
+      `observe ok: chars=${text.length} written=${result?.written ?? '?'}` +
+        ` affect=${affect.dominant ?? 'none'} intensity=${affect.intensity ?? '?'}` +
+        ` confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
+    );
+  } catch (error) {
+    log(`observe failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export function apply(ctx) {
-  log('apply() called');
+  log('apply() called (v0.0.2)');
 
   try {
     ctx.effect(
@@ -71,12 +126,25 @@ export function apply(ctx) {
 
   try {
     ctx.on('session/event', (session, event) => {
+      const type = event?.type ?? '?';
       log(
-        `session/event type=${event?.type ?? '?'}` +
+        `session/event type=${type}` +
           ` eventKeys=[${safeKeys(event)}]` +
           ` dataKeys=[${safeKeys(event?.data)}]` +
           ` sessionKeys=[${safeKeys(session)}]`,
       );
+
+      if (type !== 'user/message') return;
+
+      const data = event.data ?? {};
+      const kind = data.source?.kind;
+      const text = textOf(data.content);
+      log(`user/message source=${kind ?? '?'} chars=${text.length}`);
+
+      // Injected/plugin messages are not the user speaking.
+      if (kind && kind !== 'user') return;
+      if (text.length === 0) return;
+      void observeText(text);
     });
     log('session/event listener attached');
   } catch (error) {
@@ -84,4 +152,4 @@ export function apply(ctx) {
   }
 }
 
-export { MARKER };
+export { MARKER, textOf };

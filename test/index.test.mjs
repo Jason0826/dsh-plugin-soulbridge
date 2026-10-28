@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, MARKER } = await import('../index.js');
+const { apply, name, inject, MARKER, textOf } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -65,14 +65,28 @@ test('session/event listener logs type and payload keys', () => {
   const harness = fakeCtx();
   apply(harness.ctx);
 
-  harness.listener({ id: 's1' }, { type: 'user/message', data: { content: 'hi' } });
   harness.listener({ id: 's1' }, { type: 'assistant/message', data: { content: 'yo' } });
+  harness.listener({ id: 's1' }, { type: 'tool/call', data: { name: 'read' } });
 
   const log = readFileSync(join(home, 'plugin.log'), 'utf8');
-  assert.match(log, /session\/event type=user\/message/);
+  assert.match(log, /session\/event type=assistant\/message/);
   assert.match(log, /dataKeys=\[content\]/);
   assert.match(log, /sessionKeys=\[id\]/);
   assert.match(log, /type=assistant\/message/);
+});
+
+test('textOf: 只取 text block，其他块忽略', () => {
+  assert.equal(
+    textOf([
+      { type: 'text', text: '第一段' },
+      { type: 'image', url: 'x' },
+      { type: 'text', text: '第二段' },
+    ]),
+    '第一段\n第二段',
+  );
+  assert.equal(textOf('纯字符串'), '纯字符串');
+  assert.equal(textOf(undefined), '');
+  assert.equal(textOf([{ type: 'image' }]), '');
 });
 
 test('disposer runs on unload and is logged', () => {
