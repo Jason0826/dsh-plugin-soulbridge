@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, MARKER, textOf } = await import('../index.js');
+const { apply, name, inject, MARKER, textOf, VERSION } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -34,6 +34,11 @@ function fakeCtx() {
   };
   return { ctx, calls, get section() { return section; }, get listener() { return listener; }, get disposer() { return disposer; } };
 }
+
+test('VERSION 与 package.json 同步', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(VERSION, pkg.version);
+});
 
 test('plugin identity: name + inject', () => {
   assert.equal(name, 'dsh-plugin-soulbridge');

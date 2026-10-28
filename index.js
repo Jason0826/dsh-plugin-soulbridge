@@ -11,7 +11,7 @@
  *
  * Log: ~/.soulbridge/plugin.log (override with SOULBRIDGE_HOME).
  */
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,8 @@ export const name = 'dsh-plugin-soulbridge';
 export const inject = ['systemPrompt'];
 
 const LOG_DIR = process.env.SOULBRIDGE_HOME ?? join(homedir(), '.soulbridge');
+/** Read the version instead of hardcoding it; a stale label made debugging harder. */
+const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 const MARKER = '<soulbridge>spike: plugin loaded, injection works</soulbridge>';
 
 function log(line) {
@@ -96,7 +98,7 @@ async function observeText(text) {
 }
 
 export function apply(ctx) {
-  log('apply() called (v0.0.2)');
+  log(`apply() called (v${VERSION})`);
 
   try {
     ctx.effect(
@@ -153,4 +155,4 @@ export function apply(ctx) {
   }
 }
 
-export { MARKER, textOf };
+export { MARKER, textOf, VERSION };
