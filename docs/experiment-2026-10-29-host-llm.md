@@ -68,3 +68,48 @@ fixture 依次送进 `ctx.get('llm').stream({ provider, model, messages })`，�
 1. 在真实轮次内做一次探针，确认“鉴权上下文内调用”是否成立；
 2. 若成立，蒸馏放在 turn 内；若不成立，走 API-key provider 或端点；
 3. 端点方案（A）同时服务未来非 DSH 宿主，可作为跨宿主的参考实现。
+
+---
+
+## 补充实验（同日）：turn 内调用
+
+针对上面的开放问题——「鉴权上下文是否随 turn 传递」——单独做了一个探针包
+（`dsh-plugin-soulbridge-probe`，private，测完即卸载）：
+
+- 触发：第一次真实 `user/message`
+- 调用：同一个 `provider: deepseek-account` / `model: deepseek-flash`
+- 结果：
+
+```json
+{
+  "phase": "in-turn",
+  "ok": true,
+  "finish": "stop",
+  "chunkTypes": ["block-start", "reasoning-delta", "block-end", "text-delta", "usage", "finish"],
+  "text": "提交前先跑测试。提交前先跑测试。",
+  "ms": 1567
+}
+```
+
+**结论修订**：账号 provider 的鉴权随**请求上下文**传递，不随进程。同一个调用：
+
+| 时机 | 结果 |
+|---|---|
+| 插件 `apply()`（启动，无 turn） | `ACCOUNT_SIGN_IN_REQUIRED` |
+| 真实 `user/message` 回合内 | `ok: true`，1567 ms |
+
+所以 C 方案成立，但**只能在 turn 内调用**；不能做离线批量跑，因此「用 fixture 批量对比
+规则 vs 模型」这条路在 DSH 上不可行，只能用真实消息做长期测量。
+
+## 真实消息的规则命中率（26 次 observe）
+
+| 指标 | 值 |
+|---|---|
+| `written >= 1`（规则记住了） | 7 |
+| `written = 0`（规则漏了） | 19 |
+| 漏掉且 ≥20 字 | 6 |
+| 消息长度中位数 | 24 字 |
+| 最长 | 18205 字（一次粘贴） |
+
+如果 LLM 只在「规则漏掉」时兜底，调用量是 19/26（73%）；如果只在「漏掉且 ≥20 字」时兜底，
+是 6/26（23%）。单次调用约 1.5 秒，在 observe 的异步路径里，不阻塞用户看到回复。
