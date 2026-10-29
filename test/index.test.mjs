@@ -60,7 +60,6 @@ test('registers section, listener and effect', () => {
     ['effect', 'soulbridge.lifecycle'],
     ['section', 'soulbridge', 10],
     ['on', 'session/event'],
-    ['on', 'session/disposed'],
   ]);
   const injected = harness.section.text();
   assert.match(injected, /<soul /, '注入的是 core 生成的真实上下文');

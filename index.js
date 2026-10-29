@@ -87,8 +87,6 @@ function ensureSoul() {
 }
 
 let cache = { text: '', at: 0 };
-/** Turns seen in this session, so session end can reflect on all of them. */
-let pendingTurns = [];
 
 /** Synchronous by necessity: PromptSection.text cannot return a promise. */
 function buildInjection() {
@@ -128,22 +126,6 @@ function textOf(content) {
     .map((block) => block.text)
     .join('\n')
     .trim();
-}
-
-async function reflectTurns(turns) {
-  try {
-    const result = await ensureSoul().reflect(turns, { updateEmotion: false });
-    const state = readState();
-    writeState({
-      reflects: (state.reflects ?? 0) + 1,
-      lastReflectAt: Date.now(),
-      lastReflectMemories: result?.memories ?? 0,
-    });
-    log(`reflect ok: turns=${turns.length} memories=${result?.memories ?? '?'} superseded=${result?.superseded ?? '?'}`);
-    cache.at = 0;
-  } catch (error) {
-    log(`reflect failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
 }
 
 async function observeText(text) {
@@ -218,16 +200,6 @@ export function apply(ctx) {
           ` sessionKeys=[${safeKeys(session)}]`,
       );
 
-      // Per-turn reflection: session/disposed never fired on the desktop host,
-      // so distil at the end of each turn and keep disposed as a final flush.
-      if (type === 'turn/end') {
-        if (pendingTurns.length === 0) return;
-        const turns = pendingTurns.splice(0);
-        log(`turn/end: reflecting on ${turns.length} turns`);
-        void reflectTurns(turns);
-        return;
-      }
-
       if (type !== 'user/message') return;
 
       const data = event.data ?? {};
@@ -239,19 +211,14 @@ export function apply(ctx) {
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
       if (text.length === 0) return;
-      pendingTurns.push({ role: 'user', content: text });
       void observeText(text);
     });
     log('session/event listener attached');
 
-    ctx.on('session/disposed', () => {
-      if (pendingTurns.length === 0) return;
-      const turns = pendingTurns;
-      pendingTurns = [];
-      log(`session/disposed: reflecting on ${turns.length} turns`);
-      void reflectTurns(turns);
-    });
-    log('session/disposed listener attached');
+    // NOTE: reflect() is intentionally not wired. observe() already distils each
+    // turn (distillStrategy lives in ruleExtract), so a per-turn reflect would
+    // only return memories=0; session/disposed never fires on the desktop host.
+    // Session-level summarisation waits for a reliable trigger and LLM distillation.
   } catch (error) {
     log(`session/event listener failed: ${error instanceof Error ? error.message : String(error)}`);
   }
