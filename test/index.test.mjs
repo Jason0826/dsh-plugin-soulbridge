@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, textOf, VERSION } = await import('../index.js');
+const { apply, name, inject, textOf, VERSION, collectText } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -131,3 +131,20 @@ test('a broken service does not stop the other registrations', () => {
 });
 
 test.after(() => { try { rmSync(home, { recursive: true, force: true }); } catch { /* Windows keeps SQLite handles open */ } });
+test('collectText: text-delta and block-end are not double counted', async () => {
+  async function* stream() {
+    yield { type: 'block-start', index: 0, blockType: 'text' };
+    yield { type: 'text-delta', index: 0, text: '{"type":' };
+    yield { type: 'text-delta', index: 0, text: '"null"}' };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"type":"null"}' } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  }
+  assert.equal(await collectText(stream()), '{"type":"null"}');
+});
+
+test('collectText: block-end alone is used as the whole text', async () => {
+  async function* stream() {
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"type":"fact"}' } };
+  }
+  assert.equal(await collectText(stream()), '{"type":"fact"}');
+});

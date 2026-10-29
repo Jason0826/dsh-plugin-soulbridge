@@ -78,24 +78,42 @@ function makeLlm(ctx, config) {
   return async (prompt) => {
     const service = ctx.get('llm');
     if (!service) throw new Error('llm service unavailable');
-    let text = '';
-    for await (const chunk of service.stream({
-      provider: config.provider,
-      model: config.model,
-      messages: [
-        {
-          id: `distill_${Date.now()}`,
-          role: 'user',
-          content: [{ type: 'text', text: prompt }],
-          source: { kind: 'user' },
-        },
-      ],
-    })) {
-      if (chunk.type === 'text-delta') text += chunk.text;
-      if (chunk.type === 'block-end' && chunk.block?.type === 'text') text += chunk.block.text ?? '';
-    }
-    return text;
+    return collectText(
+      service.stream({
+        provider: config.provider,
+        model: config.model,
+        messages: [
+          {
+            id: `distill_${Date.now()}`,
+            role: 'user',
+            content: [{ type: 'text', text: prompt }],
+            source: { kind: 'user' },
+          },
+        ],
+      }),
+    );
   };
+}
+
+/**
+ * Collect the stream's text exactly once.
+ *
+ * The host emits `text-delta` chunks and then a `block-end` carrying the whole
+ * block. Concatenating both doubled every reply, which turned valid JSON into
+ * two concatenated objects and made every distillation look like `failed`.
+ */
+export async function collectText(stream) {
+  let text = '';
+  let sawDelta = false;
+  for await (const chunk of stream) {
+    if (chunk.type === 'text-delta') {
+      text += chunk.text;
+      sawDelta = true;
+    } else if (!sawDelta && chunk.type === 'block-end' && chunk.block?.type === 'text') {
+      text += chunk.block.text ?? '';
+    }
+  }
+  return text;
 }
 
 function log(line) {
