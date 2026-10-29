@@ -411,6 +411,45 @@ export function apply(ctx) {
     log(`section registration failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  // Probe (brief 0004): the real window is agent/pre-step — the current user
+  // messages are in the payload and the waterfall can change the decision.
+  // Gated by plugin-config.json { "preStepProbe": true } so production stays as is.
+  try {
+    if (ctx.on) {
+      ctx.on('agent/pre-step', async (payload, next) => {
+        const decision = await next();
+        try {
+          const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+          const last = textOf(messages[messages.length - 1]?.content);
+          const wanted = readConfig().preStepProbe === true;
+          log(
+            `prestep: turn=${payload?.turn ?? '?'} step=${payload?.step ?? '?'}` +
+              ` msgs=${messages.length} kind=${decision?.kind ?? '?'} chars=${last.length}`,
+          );
+          if (!wanted || decision?.kind !== 'enter') return decision;
+          const note = {
+            id: `probe_${Date.now()}`,
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: '内部探针：如果你能看到这条消息，请在回复末尾原样输出 ZQ7-PROBE。',
+              },
+            ],
+            source: { kind: 'user' },
+          };
+          return { ...decision, messages: [...decision.messages, note] };
+        } catch (error) {
+          log(`prestep probe failed: ${error instanceof Error ? error.message : String(error)}`);
+          return decision;
+        }
+      });
+      log('pre-step listener attached');
+    }
+  } catch (error) {
+    log(`pre-step listener failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   // Tools (RFC 0005): registered only when the host exposes the service, and
   // disposed with the plugin so a reload cannot register twice.
   try {
