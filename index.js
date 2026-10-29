@@ -22,6 +22,21 @@ export const inject = ['systemPrompt'];
 const HOME = process.env.SOULBRIDGE_HOME ?? join(homedir(), '.soulbridge');
 const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 const STATE_FILE = join(HOME, 'plugin-state.json');
+/**
+ * The model's raw replies, complete. Written as JSON strings so newlines stay
+ * one line per entry; nothing is cut, because a truncated failure message is
+ * what made an earlier diagnosis impossible.
+ */
+const LLM_RAW_FILE = join(HOME, 'llm-raw.log');
+
+function logLlmRaw(raw) {
+  try {
+    mkdirSync(HOME, { recursive: true });
+    appendFileSync(LLM_RAW_FILE, `${new Date().toISOString()} ${JSON.stringify(String(raw))}\n`);
+  } catch (error) {
+    log(`llm raw write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 /** Injection policy: what may reach the prompt, and how much of it. */
 const INJECT = {
@@ -132,6 +147,7 @@ function ensureSoul() {
       deviceId: config.deviceId,
       llm: injectedLlm,
       llmMaxChars: injectedMaxLlmChars,
+      onLlmRaw: logLlmRaw,
     });
     log(`soul ready: db=${resolveDbPath()} soul=${config.soulId} user=${config.userId}`);
     writeState({ appliedAt: readState().appliedAt ?? Date.now(), soulId: config.soulId, userId: config.userId });
