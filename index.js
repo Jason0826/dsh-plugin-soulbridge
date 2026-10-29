@@ -212,6 +212,124 @@ async function observeText(text) {
   }
 }
 
+/** Tool output must match the declared schema; text blocks keep it readable. */
+function textRender(_args, value) {
+  return [{ type: 'text', text: JSON.stringify(value) }];
+}
+
+function recallTool() {
+  return {
+    name: 'soul_recall',
+    description:
+      '按关键词从长期记忆里召回相关条目。当用户提到过去说过的话、偏好、约定，' +
+      '或你不确定某事是否记过时使用。返回按相关性排序的条目。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '检索关键词，通常是用户当前问题里的主题词' },
+        limit: { type: 'number', description: '返回条数，默认 5，上限 20' },
+      },
+      required: ['query'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          count: { type: 'number' },
+          memories: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                type: { type: 'string' },
+                content: { type: 'string' },
+                score: { type: 'number' },
+              },
+              required: ['id', 'type', 'content', 'score'],
+            },
+          },
+          reason: { type: 'string' },
+        },
+        required: ['ok', 'count', 'memories'],
+      },
+      render: textRender,
+    },
+    async execute(args) {
+      try {
+        const query = String(args?.query ?? '').trim();
+        if (query.length === 0) return { ok: false, count: 0, memories: [], reason: 'empty query' };
+        const limit = Math.min(20, Math.max(1, Number(args?.limit ?? 5)));
+        const hits = ensureSoul().recall(query, limit);
+        log(`tool soul_recall: chars=${query.length} hits=${hits.length}`);
+        return {
+          ok: true,
+          count: hits.length,
+          memories: hits.map((hit) => ({
+            id: hit.memory.id,
+            type: hit.memory.type,
+            content: hit.memory.content,
+            score: Number(hit.score.toFixed(3)),
+          })),
+        };
+      } catch (error) {
+        return { ok: false, count: 0, memories: [], reason: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  };
+}
+
+function rememberTool() {
+  return {
+    name: 'soul_remember',
+    description:
+      '把一件值得长期记住的事写进记忆。只在用户明确要求记住、或确认这是一条长期约定/偏好时使用；' +
+      '不要用它记录一次性的临时信息。',
+    parameters: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: '要记住的内容，一句话，不超过 200 字' },
+        type: {
+          type: 'string',
+          enum: ['strategy', 'fact', 'trait', 'cognition'],
+          description: 'strategy=规则/做法，fact=事实，trait=偏好，cognition=原则',
+        },
+        importance: { type: 'number', description: '1-10，默认 7' },
+      },
+      required: ['content'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          id: { type: 'string' },
+          duplicate: { type: 'boolean' },
+          reason: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render: textRender,
+    },
+    async execute(args) {
+      try {
+        const content = String(args?.content ?? '').trim();
+        const type = typeof args?.type === 'string' ? args.type : undefined;
+        const importance = args?.importance === undefined ? undefined : Number(args.importance);
+        const result = ensureSoul().rememberExplicit({ content, type, importance });
+        log(`tool soul_remember: ok=${result.ok} duplicate=${result.duplicate ?? false}`);
+        return result;
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  };
+}
+
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
   writeState({ appliedAt: Date.now(), version: VERSION });
@@ -251,6 +369,36 @@ export function apply(ctx) {
     log('section registered (name=soulbridge order=10)');
   } catch (error) {
     log(`section registration failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Tools (RFC 0005): registered only when the host exposes the service, and
+  // disposed with the plugin so a reload cannot register twice.
+  try {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['tools'], (toolsCtx) => {
+        const tools = toolsCtx.get('tools');
+        if (!tools) {
+          log('tools: service unavailable; disabled');
+          return;
+        }
+        const disposers = [tools.register(recallTool()), tools.register(rememberTool())];
+        log('tools registered (soul_recall, soul_remember)');
+        ctx.effect(() => () => {
+          for (const dispose of disposers) {
+            try {
+              dispose?.();
+            } catch {
+              // A failed disposer must not block the rest of unload.
+            }
+          }
+          log('tools disposed');
+        });
+      });
+    } else {
+      log('tools: ctx.inject unavailable; disabled');
+    }
+  } catch (error) {
+    log(`tools registration failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   try {
