@@ -287,11 +287,12 @@ function rememberTool() {
     name: 'soul_remember',
     description:
       '把一件值得长期记住的事写进记忆。只在用户明确要求记住、或确认这是一条长期约定/偏好时使用；' +
-      '不要用它记录一次性的临时信息。',
+      '不要用它记录一次性的临时信息。content 必须写用户的原话（可精简，不可改写含义），' +
+      '不要写"这是用户要求记住的一条内容"这类元描述；系统已经自动记录过的内容不要去重写。',
     parameters: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: '要记住的内容，一句话，不超过 200 字' },
+        content: { type: 'string', description: '用户的原话（可精简），不超过 200 字' },
         type: {
           type: 'string',
           enum: ['strategy', 'fact', 'trait', 'cognition'],
