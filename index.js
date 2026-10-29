@@ -112,6 +112,9 @@ function writeState(patch) {
 
 let soul = null;
 let soulError = null;
+/** Injected by apply(); the Soul reads them once at construction. */
+let injectedLlm;
+let injectedMaxLlmChars = 2000;
 
 /** Open the soul once. Throws only the first time; callers degrade to no injection. */
 function ensureSoul() {
@@ -125,6 +128,8 @@ function ensureSoul() {
       userId: config.userId,
       name: config.name,
       deviceId: config.deviceId,
+      llm: injectedLlm,
+      llmMaxChars: injectedMaxLlmChars,
     });
     log(`soul ready: db=${resolveDbPath()} soul=${config.soulId} user=${config.userId}`);
     writeState({ appliedAt: readState().appliedAt ?? Date.now(), soulId: config.soulId, userId: config.userId });
@@ -179,10 +184,10 @@ function textOf(content) {
     .trim();
 }
 
-async function observeText(text, llm, maxLlmChars) {
+async function observeText(text) {
   const started = Date.now();
   try {
-    const result = await ensureSoul().observe({ role: 'user', content: text }, { llm, maxLlmChars });
+    const result = await ensureSoul().observe({ role: 'user', content: text });
     const affect = result?.affect ?? {};
     const state = readState();
     writeState({
@@ -210,8 +215,9 @@ export function apply(ctx) {
   writeState({ appliedAt: Date.now(), version: VERSION });
 
   const config = readConfig();
-  const llm = makeLlm(ctx, config);
-  log(`distill=${config.distill}${llm ? ' via host model' : ' (rules only)'}`);
+  injectedLlm = makeLlm(ctx, config);
+  injectedMaxLlmChars = config.maxLlmChars;
+  log(`distill=${config.distill}${injectedLlm ? ' via host model' : ' (rules only)'}`);
 
   try {
     ctx.effect(
@@ -266,7 +272,7 @@ export function apply(ctx) {
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
       if (text.length === 0) return;
-      void observeText(text, llm, config.maxLlmChars);
+      void observeText(text);
     });
     log('session/event listener attached');
 
