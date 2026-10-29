@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-soulbridge",
-  "version": "0.0.26",
+  "version": "0.0.27",
   "description": "Inject soulbridge context into DSH sessions and feed user turns back as observations.",
   "type": "module",
   "main": "index.js",
