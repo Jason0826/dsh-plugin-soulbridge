@@ -132,7 +132,7 @@ function textOf(content) {
 
 async function reflectTurns(turns) {
   try {
-    const result = await ensureSoul().reflect(turns);
+    const result = await ensureSoul().reflect(turns, { updateEmotion: false });
     const state = readState();
     writeState({
       reflects: (state.reflects ?? 0) + 1,
@@ -217,6 +217,16 @@ export function apply(ctx) {
           ` dataKeys=[${safeKeys(event?.data)}]` +
           ` sessionKeys=[${safeKeys(session)}]`,
       );
+
+      // Per-turn reflection: session/disposed never fired on the desktop host,
+      // so distil at the end of each turn and keep disposed as a final flush.
+      if (type === 'turn/end') {
+        if (pendingTurns.length === 0) return;
+        const turns = pendingTurns.splice(0);
+        log(`turn/end: reflecting on ${turns.length} turns`);
+        void reflectTurns(turns);
+        return;
+      }
 
       if (type !== 'user/message') return;
 
