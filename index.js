@@ -32,6 +32,57 @@ const INJECT = {
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
 const CACHE_MS = 30_000;
 
+/**
+ * Optional plugin config: ~/.soulbridge/plugin-config.json
+ * { "distill": "rules" | "llm", "provider": "...", "model": "...", "maxLlmChars": 2000 }
+ *
+ * Rules are the default. With "llm", the host model is asked only when the
+ * rules found nothing, so it adds recall without overriding a rule that fired.
+ */
+const CONFIG_FILE = join(HOME, 'plugin-config.json');
+const CONFIG_DEFAULTS = {
+  distill: 'rules',
+  provider: 'deepseek-account',
+  model: 'deepseek-flash',
+  maxLlmChars: 2000,
+};
+
+function readConfig() {
+  try {
+    return { ...CONFIG_DEFAULTS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
+  } catch {
+    return { ...CONFIG_DEFAULTS };
+  }
+}
+
+/** Adapter side of the core LlmFn port: the host model, called inside a turn. */
+function makeLlm(ctx, config) {
+  if (config.distill !== 'llm') return undefined;
+  // Resolve the service on first use: at apply() time the llm plugin may not be
+  // registered yet, and the probe showed the call only works inside a turn.
+  return async (prompt) => {
+    const service = ctx.get('llm');
+    if (!service) throw new Error('llm service unavailable');
+    let text = '';
+    for await (const chunk of service.stream({
+      provider: config.provider,
+      model: config.model,
+      messages: [
+        {
+          id: `distill_${Date.now()}`,
+          role: 'user',
+          content: [{ type: 'text', text: prompt }],
+          source: { kind: 'user' },
+        },
+      ],
+    })) {
+      if (chunk.type === 'text-delta') text += chunk.text;
+      if (chunk.type === 'block-end' && chunk.block?.type === 'text') text += chunk.block.text ?? '';
+    }
+    return text;
+  };
+}
+
 function log(line) {
   try {
     mkdirSync(HOME, { recursive: true });
@@ -128,10 +179,10 @@ function textOf(content) {
     .trim();
 }
 
-async function observeText(text) {
+async function observeText(text, llm, maxLlmChars) {
   const started = Date.now();
   try {
-    const result = await ensureSoul().observe({ role: 'user', content: text });
+    const result = await ensureSoul().observe({ role: 'user', content: text }, { llm, maxLlmChars });
     const affect = result?.affect ?? {};
     const state = readState();
     writeState({
@@ -142,7 +193,7 @@ async function observeText(text) {
       lastAffect: affect.dominant ?? null,
     });
     log(
-      `observe ok: chars=${text.length} written=${result?.written ?? '?'}` +
+      `observe ok: chars=${text.length} written=${result?.written ?? '?'} by=${result?.extractedBy ?? '?'}` +
         ` affect=${affect.dominant ?? 'none'} confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
     );
     cache.at = 0; // a new observation may change what should be injected
@@ -157,6 +208,10 @@ async function observeText(text) {
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
   writeState({ appliedAt: Date.now(), version: VERSION });
+
+  const config = readConfig();
+  const llm = makeLlm(ctx, config);
+  log(`distill=${config.distill}${llm ? ' via host model' : ' (rules only)'}`);
 
   try {
     ctx.effect(
@@ -211,7 +266,7 @@ export function apply(ctx) {
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
       if (text.length === 0) return;
-      void observeText(text);
+      void observeText(text, llm, config.maxLlmChars);
     });
     log('session/event listener attached');
 

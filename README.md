@@ -71,3 +71,26 @@ pnpm 会同时报 `ERR_PNPM_UNEXPECTED_STORE` 和 `ERR_PNPM_UNEXPECTED_VIRTUAL_S
 DSH 启动器对 `package.json` 直接 `JSON.parse`，不剥 BOM。用 Windows PowerShell 的
 `Set-Content -Encoding utf8` 改它会写入 BOM，导致启动崩溃或 bundle 被静默跳过。
 本仓库用 `scripts/profile-manifest.ps1` 改写清单，用 `scripts/check-encodings.ps1` 检查编码。
+
+## 配置（可选）
+
+`~/.soulbridge/plugin-config.json`：
+
+```json
+{
+  "distill": "llm",
+  "provider": "deepseek-account",
+  "model": "deepseek-flash",
+  "maxLlmChars": 2000
+}
+```
+
+| 字段 | 作用 |
+|---|---|
+| `distill` | `rules`（默认）只在本地做规则抽取；`llm` 在**规则没抽到**时再问宿主模型 |
+| `provider` / `model` | 宿主模型路由；只在 `distill: llm` 时使用 |
+| `maxLlmChars` | 超过此长度的消息不送模型（跳过并记录，不做截断） |
+
+为什么是"规则优先、模型补漏"：实测规则精确率 1.00，但 26 条真实消息里漏了 19 条；
+让模型覆盖规则没有收益，只在漏掉时补才有。宿主模型**只能在真实轮次内调用**，
+启动时调用会被账号 provider 拒绝（见 `docs/experiment-2026-10-29-host-llm.md`）。
