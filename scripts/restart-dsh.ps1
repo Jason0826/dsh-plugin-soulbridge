@@ -20,6 +20,9 @@ param(
   [int]$StableSeconds = 45,
   [string]$Profile = 'D:\DSH\home\profiles\desktop',
   [string]$Bundle = 'dsh-plugin-soulbridge',
+  # Point the plugin at a different home (config, database, logs). Used to run
+  # experiments against a throwaway database instead of the real one.
+  [string]$SoulbridgeHome = '',
   [switch]$SkipFallback
 )
 
@@ -59,6 +62,10 @@ function Write-LatestCrash {
 # Returns $true when the process survives and the webhost is listening.
 function Start-AndWatch([string]$label) {
   Write-Log "${label}: launching"
+  if ($SoulbridgeHome -ne '') {
+    $env:SOULBRIDGE_HOME = $SoulbridgeHome
+    Write-Log "${label}: SOULBRIDGE_HOME=$SoulbridgeHome"
+  }
   try { Start-Process -FilePath $Exe | Out-Null } catch {
     Write-Log "${label}: start threw: $($_.Exception.Message)"; return $false
   }

@@ -147,6 +147,8 @@ let soul = null;
 let soulError = null;
 /** Last reply text, so a correction can be stored with what it targets. */
 let lastAssistantText;
+/** Last human message, for the injection timing probe and (later) ranking. */
+let lastUserText = '';
 /** Injected by apply(); the Soul reads them once at construction. */
 let injectedLlm;
 let injectedMaxLlmChars = 2000;
@@ -183,6 +185,9 @@ let cache = { text: '', at: 0 };
 /** Synchronous by necessity: PromptSection.text cannot return a promise. */
 function buildInjection() {
   const now = Date.now();
+  // Timing probe (brief 0004): is the current user message visible when the
+  // section is evaluated? Logged on every evaluation, before the cache check.
+  log(`inject probe: lastUser=${JSON.stringify(lastUserText.slice(0, 20))} chars=${lastUserText.length}`);
   if (now - cache.at < CACHE_MS) return cache.text;
   try {
     const result = ensureSoul().context({ track: false, ...INJECT });
@@ -463,6 +468,7 @@ export function apply(ctx) {
       // Only the human's own prose. runtime-context / time-context / injected
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
+      lastUserText = text;
       if (text.length === 0) return;
 
       // Evidence, not memory (RFC 0003 phase A): a correction is recorded with
