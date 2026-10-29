@@ -11,7 +11,7 @@
  * unhappy. What was injected, observed, or skipped is written to
  * ~/.soulbridge/plugin-state.json.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openSqlite, ensureConfig, resolveDbPath, Soul } from 'soulbridge';
@@ -154,76 +154,6 @@ async function observeText(text) {
   }
 }
 
-/**
- * One-shot POC mode (temporary): when ~/.soulbridge/poc.json exists, run its
- * fixtures through the HOST's own model (ctx.llm) and write raw outputs.
- *
- * This measures the same transport a production DSH adapter would use, with no
- * extra key or endpoint. Delete the file to disable.
- */
-async function runPoc(ctx) {
-  const file = join(HOME, 'poc.json');
-  if (!existsSync(file)) return;
-  const llmService = ctx.get('llm');
-  if (!llmService) {
-    log('poc: llm service unavailable');
-    return;
-  }
-
-  let config;
-  try {
-    config = JSON.parse(readFileSync(file, 'utf8'));
-  } catch (error) {
-    log(`poc: bad config: ${error instanceof Error ? error.message : String(error)}`);
-    return;
-  }
-
-  const results = [];
-  for (const fixture of config.fixtures ?? []) {
-    const started = Date.now();
-    try {
-      let text = '';
-      const types = new Set();
-      let finish = null;
-      let detail = null;
-      for await (const chunk of llmService.stream({
-        provider: config.provider,
-        model: config.model,
-        messages: [
-          {
-            id: `poc_${fixture.id}`,
-            role: 'user',
-            content: [{ type: 'text', text: `${config.prompt}\n\n用户：${fixture.text}` }],
-            source: { kind: 'user' },
-          },
-        ],
-      })) {
-        types.add(chunk.type);
-        if (chunk.type === 'text-delta') text += chunk.text;
-        if (chunk.type === 'block-end' && chunk.block?.type === 'text') text += chunk.block.text ?? '';
-        if (chunk.type === 'finish') {
-          finish = chunk.reason?.kind ?? String(chunk.reason);
-          if (chunk.reason?.kind === 'error') {
-            detail = JSON.stringify(chunk.reason.failure ?? chunk.reason).slice(0, 400);
-            log(`poc: ${fixture.id} failed: ${detail}`);
-          }
-        }
-      }
-      results.push({ id: fixture.id, raw: text.trim(), chunkTypes: [...types], finish, detail, ms: Date.now() - started });
-    } catch (error) {
-      results.push({ id: fixture.id, error: error instanceof Error ? error.message : String(error), ms: Date.now() - started });
-    }
-    log(`poc: ${fixture.id} done`);
-  }
-
-  try {
-    writeFileSync(config.out, JSON.stringify(results, null, 2), 'utf8');
-    log(`poc: wrote ${results.length} results to ${config.out}`);
-  } catch (error) {
-    log(`poc: write failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
   writeState({ appliedAt: Date.now(), version: VERSION });
@@ -285,7 +215,6 @@ export function apply(ctx) {
     });
     log('session/event listener attached');
 
-    void runPoc(ctx);
 
     // NOTE: reflect() is intentionally not wired. observe() already distils each
     // turn (distillStrategy lives in ruleExtract), so a per-turn reflect would
