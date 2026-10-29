@@ -11,7 +11,7 @@ soulbridge 的核心不知道 DSH 的存在；这个包只做**接线**：在正
 |---|---|---|
 | 提示组装 | `context({ track: false })` → 注入 `<soul>` / `<style>` / `<affect>` / `<memories>` | 🚧 目前是占位标记 |
 | 每条**用户**消息 | `observe(turn)` → 写记忆 + 情绪采样 | ✅ 已实现 |
-| 会话结束 | `reflect(turns)` | 🚧 未接 |
+| 会话结束 | `reflect(turns)` | ❌ 未接：`observe` 已逐轮蒸馏，`session/disposed` 在桌面端不触发 |
 | 模型主动查询 | `recall` / `remember` 工具 | 🚧 未接 |
 
 **不会做**：改变事实判断、编造记忆、把个人记忆写进项目文件。
