@@ -183,14 +183,26 @@ async function runPoc(ctx) {
     const started = Date.now();
     try {
       let text = '';
+      const types = new Set();
+      let finish = null;
       for await (const chunk of llmService.stream({
         provider: config.provider,
         model: config.model,
-        messages: [{ role: 'user', content: `${config.prompt}\n\n用户：${fixture.text}` }],
+        messages: [
+          {
+            id: `poc_${fixture.id}`,
+            role: 'user',
+            content: [{ type: 'text', text: `${config.prompt}\n\n用户：${fixture.text}` }],
+            source: { kind: 'user' },
+          },
+        ],
       })) {
+        types.add(chunk.type);
         if (chunk.type === 'text-delta') text += chunk.text;
+        if (chunk.type === 'block-end' && chunk.block?.type === 'text') text += chunk.block.text ?? '';
+        if (chunk.type === 'finish') finish = chunk.reason?.kind ?? String(chunk.reason);
       }
-      results.push({ id: fixture.id, raw: text.trim(), ms: Date.now() - started });
+      results.push({ id: fixture.id, raw: text.trim(), chunkTypes: [...types], finish, ms: Date.now() - started });
     } catch (error) {
       results.push({ id: fixture.id, error: error instanceof Error ? error.message : String(error), ms: Date.now() - started });
     }
