@@ -59,6 +59,7 @@ test('registers section, listener and effect', () => {
   assert.deepEqual(harness.calls, [
     ['effect', 'soulbridge.lifecycle'],
     ['section', 'soulbridge', 10],
+    ['on', 'agent/pre-step'],
     ['on', 'session/event'],
   ]);
   const injected = harness.section.text();
