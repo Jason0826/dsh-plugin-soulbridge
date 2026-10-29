@@ -185,6 +185,7 @@ async function runPoc(ctx) {
       let text = '';
       const types = new Set();
       let finish = null;
+      let detail = null;
       for await (const chunk of llmService.stream({
         provider: config.provider,
         model: config.model,
@@ -200,9 +201,15 @@ async function runPoc(ctx) {
         types.add(chunk.type);
         if (chunk.type === 'text-delta') text += chunk.text;
         if (chunk.type === 'block-end' && chunk.block?.type === 'text') text += chunk.block.text ?? '';
-        if (chunk.type === 'finish') finish = chunk.reason?.kind ?? String(chunk.reason);
+        if (chunk.type === 'finish') {
+          finish = chunk.reason?.kind ?? String(chunk.reason);
+          if (chunk.reason?.kind === 'error') {
+            detail = JSON.stringify(chunk.reason.failure ?? chunk.reason).slice(0, 400);
+            log(`poc: ${fixture.id} failed: ${detail}`);
+          }
+        }
       }
-      results.push({ id: fixture.id, raw: text.trim(), chunkTypes: [...types], finish, ms: Date.now() - started });
+      results.push({ id: fixture.id, raw: text.trim(), chunkTypes: [...types], finish, detail, ms: Date.now() - started });
     } catch (error) {
       results.push({ id: fixture.id, error: error instanceof Error ? error.message : String(error), ms: Date.now() - started });
     }
