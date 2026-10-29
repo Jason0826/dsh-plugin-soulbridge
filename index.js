@@ -38,12 +38,6 @@ function logLlmRaw(raw) {
   }
 }
 
-/** Injection policy: what may reach the prompt, and how much of it. */
-const INJECT = {
-  types: ['strategy', 'fact', 'trait'],
-  minImportance: 6,
-  maxItems: 5,
-};
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
 const CACHE_MS = 30_000;
 
@@ -147,8 +141,6 @@ let soul = null;
 let soulError = null;
 /** Last reply text, so a correction can be stored with what it targets. */
 let lastAssistantText;
-/** Last human message, for the injection timing probe and (later) ranking. */
-let lastUserText = '';
 /** Injected by apply(); the Soul reads them once at construction. */
 let injectedLlm;
 let injectedMaxLlmChars = 2000;
@@ -182,15 +174,21 @@ function ensureSoul() {
 
 let cache = { text: '', at: 0 };
 
+/**
+ * Anchors: the few rules that should always be visible. Kept in the system
+ * prompt because that section is evaluated before the message arrives, so it
+ * cannot rank anything.
+ */
+const ANCHOR = { types: ['strategy', 'fact', 'trait'], minImportance: 8, maxItems: 3 };
+/** Related memories: ranked against the current message inside agent/pre-step. */
+const RELATED = { types: ['strategy', 'fact', 'trait'], minImportance: 6, maxItems: 5 };
+
 /** Synchronous by necessity: PromptSection.text cannot return a promise. */
 function buildInjection() {
   const now = Date.now();
-  // Timing probe (brief 0004): is the current user message visible when the
-  // section is evaluated? Logged on every evaluation, before the cache check.
-  log(`inject probe: lastUser=${JSON.stringify(lastUserText.slice(0, 20))} chars=${lastUserText.length}`);
   if (now - cache.at < CACHE_MS) return cache.text;
   try {
-    const result = ensureSoul().context({ track: false, ...INJECT });
+    const result = ensureSoul().context({ track: false, ...ANCHOR });
     cache = { text: result.text, at: now };
     const state = readState();
     writeState({
@@ -223,6 +221,64 @@ function textOf(content) {
     .map((block) => block.text)
     .join('\n')
     .trim();
+}
+
+/** Memories ranked against the current message, for the pre-step injection. */
+function buildRelatedContext(text) {
+  const result = ensureSoul().context({ track: false, query: text, ...RELATED });
+  return result.text;
+}
+
+/**
+ * Build the agent/pre-step middleware (RFC 0006).
+ *
+ * Idempotence is by construction, not cleanup: one injection per (session,
+ * turn), and the injected message carries a source kind the observer ignores —
+ * the probe showed that using `user` there fed injected text back into memory.
+ *
+ * @param deps.getContext - returns the memory block for one message, or ''.
+ */
+export function createPreStepHandler(deps) {
+  /** sessionId -> last turn that received an injection */
+  const injectedTurn = new Map();
+
+  return async (payload, next) => {
+    const decision = await next();
+    try {
+      if (decision?.kind !== 'enter') return decision;
+      const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+      const text = textOf(messages[messages.length - 1]?.content);
+      if (text.length === 0) return decision;
+
+      const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
+      const turn = payload?.turn;
+      if (injectedTurn.get(sessionId) === turn) return decision;
+
+      const block = deps.getContext(text);
+      injectedTurn.set(sessionId, turn);
+      if (injectedTurn.size > 16) {
+        // Keep the map bounded: drop the oldest entry, not the newest.
+        const oldest = injectedTurn.keys().next().value;
+        if (oldest !== undefined) injectedTurn.delete(oldest);
+      }
+      if (!block) {
+        log(`prestep: no related memory (turn=${turn})`);
+        return decision;
+      }
+
+      const note = {
+        id: `memctx_${turn}`,
+        role: 'user',
+        content: [{ type: 'text', text: block }],
+        source: { kind: 'memory-context' },
+      };
+      log(`prestep: inject turn=${turn} chars=${block.length}`);
+      return { ...decision, messages: [...decision.messages, note] };
+    } catch (error) {
+      log(`prestep: skipped after error: ${error instanceof Error ? error.message : String(error)}`);
+      return decision;
+    }
+  };
 }
 
 async function observeText(text) {
@@ -411,39 +467,12 @@ export function apply(ctx) {
     log(`section registration failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // Probe (brief 0004): the real window is agent/pre-step — the current user
-  // messages are in the payload and the waterfall can change the decision.
-  // Gated by plugin-config.json { "preStepProbe": true } so production stays as is.
+  // RFC 0006: relevant memories are injected here, not in the system prompt —
+  // this is the only point that runs after the user message and before the
+  // request, and its waterfall can change the request.
   try {
     if (ctx.on) {
-      ctx.on('agent/pre-step', async (payload, next) => {
-        const decision = await next();
-        try {
-          const messages = Array.isArray(payload?.messages) ? payload.messages : [];
-          const last = textOf(messages[messages.length - 1]?.content);
-          const wanted = readConfig().preStepProbe === true;
-          log(
-            `prestep: turn=${payload?.turn ?? '?'} step=${payload?.step ?? '?'}` +
-              ` msgs=${messages.length} kind=${decision?.kind ?? '?'} chars=${last.length}`,
-          );
-          if (!wanted || decision?.kind !== 'enter') return decision;
-          const note = {
-            id: `probe_${Date.now()}`,
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: '内部探针：如果你能看到这条消息，请在回复末尾原样输出 ZQ7-PROBE。',
-              },
-            ],
-            source: { kind: 'user' },
-          };
-          return { ...decision, messages: [...decision.messages, note] };
-        } catch (error) {
-          log(`prestep probe failed: ${error instanceof Error ? error.message : String(error)}`);
-          return decision;
-        }
-      });
+      ctx.on('agent/pre-step', createPreStepHandler({ getContext: buildRelatedContext }));
       log('pre-step listener attached');
     }
   } catch (error) {
@@ -507,7 +536,6 @@ export function apply(ctx) {
       // Only the human's own prose. runtime-context / time-context / injected
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
-      lastUserText = text;
       if (text.length === 0) return;
 
       // Evidence, not memory (RFC 0003 phase A): a correction is recorded with

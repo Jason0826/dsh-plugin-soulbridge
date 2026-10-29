@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, textOf, VERSION, collectText } = await import('../index.js');
+const { apply, name, inject, textOf, VERSION, collectText, createPreStepHandler } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -148,4 +148,59 @@ test('collectText: block-end alone is used as the whole text', async () => {
     yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"type":"fact"}' } };
   }
   assert.equal(await collectText(stream()), '{"type":"fact"}');
+});test('pre-step: one injection per turn, retries included', async () => {
+  const handler = createPreStepHandler({ getContext: () => 'MEMORY-BLOCK' });
+  const next = async () => ({ kind: 'enter', messages: [] });
+  const payload = {
+    agent: { id: 'agent-1' },
+    turn: 7,
+    step: 1,
+    messages: [{ id: 'u1', role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  };
+
+  const first = await handler(payload, next);
+  assert.equal(first.messages.length, 1, 'first step injects');
+  const second = await handler({ ...payload, step: 2 }, next);
+  assert.equal(second.messages.length, 0, 'second step of the same turn is skipped');
+  const retry = await handler({ ...payload, step: 1 }, next);
+  assert.equal(retry.messages.length, 0, 'a retried step does not inject again');
+});
+
+test('pre-step: injected message is not marked as a human message', async () => {
+  const handler = createPreStepHandler({ getContext: () => 'MEMORY-BLOCK' });
+  const next = async () => ({ kind: 'enter', messages: [] });
+  const result = await handler(
+    { agent: { id: 'a2' }, turn: 1, messages: [{ content: [{ type: 'text', text: 'hi' }] }] },
+    next,
+  );
+  assert.equal(result.messages[0].source.kind, 'memory-context');
+  assert.match(result.messages[0].id, /^memctx_/);
+});
+
+test('pre-step: an empty block adds nothing', async () => {
+  const handler = createPreStepHandler({ getContext: () => '' });
+  const next = async () => ({ kind: 'enter', messages: [] });
+  const result = await handler(
+    { agent: { id: 'a3' }, turn: 1, messages: [{ content: [{ type: 'text', text: 'hi' }] }] },
+    next,
+  );
+  assert.equal(result.messages.length, 0);
+});
+
+test('pre-step: a throwing lookup never breaks the turn', async () => {
+  const handler = createPreStepHandler({ getContext: () => { throw new Error('db down'); } });
+  const next = async () => ({ kind: 'enter', messages: [] });
+  const result = await handler(
+    { agent: { id: 'a4' }, turn: 1, messages: [{ content: [{ type: 'text', text: 'hi' }] }] },
+    next,
+  );
+  assert.deepEqual(result, { kind: 'enter', messages: [] });
+});
+
+test('pre-step: rejected decisions are left alone', async () => {
+  let called = false;
+  const handler = createPreStepHandler({ getContext: () => { called = true; return 'X'; } });
+  const result = await handler({ agent: { id: 'a5' }, turn: 1, messages: [] }, async () => ({ kind: 'reject' }));
+  assert.deepEqual(result, { kind: 'reject' });
+  assert.equal(called, false, 'no lookup when the step is not entered');
 });
