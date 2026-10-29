@@ -200,7 +200,7 @@ async function observeText(text) {
       lastAffect: affect.dominant ?? null,
     });
     log(
-      `observe ok: chars=${text.length} written=${result?.written ?? '?'} committed=${result?.committed ?? '?'} by=${result?.extractedBy ?? '?'}` +
+      `observe ok: chars=${text.length} written=${result?.written ?? '?'} committed=${result?.committed ?? '?'} by=${result?.extractedBy ?? '?'} llm=${result?.llmOutcome ?? '?'}` +
         ` affect=${affect.dominant ?? 'none'} confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
     );
     cache.at = 0; // a new observation may change what should be injected
