@@ -14,7 +14,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { openSqlite, ensureConfig, resolveDbPath, Soul } from 'soulbridge';
+import { openSqlite, ensureConfig, resolveDbPath, Soul, isCorrection, correctionRule } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
 export const inject = ['systemPrompt'];
@@ -112,6 +112,8 @@ function writeState(patch) {
 
 let soul = null;
 let soulError = null;
+/** Last reply text, so a correction can be stored with what it targets. */
+let lastAssistantText;
 /** Injected by apply(); the Soul reads them once at construction. */
 let injectedLlm;
 let injectedMaxLlmChars = 2000;
@@ -261,6 +263,13 @@ export function apply(ctx) {
           ` sessionKeys=[${safeKeys(session)}]`,
       );
 
+      // Keep the last reply: a correction only makes sense next to what it targets.
+      if (type === 'assistant/message') {
+        const reply = textOf(event.data?.message?.content);
+        if (reply.length > 0) lastAssistantText = reply;
+        return;
+      }
+
       if (type !== 'user/message') return;
 
       const data = event.data ?? {};
@@ -272,6 +281,22 @@ export function apply(ctx) {
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
       if (text.length === 0) return;
+
+      // Evidence, not memory (RFC 0003 phase A): a correction is recorded with
+      // the reply it targeted, untouched, and never injected.
+      if (isCorrection(text)) {
+        try {
+          const id = ensureSoul().recordCorrection({
+            userText: text,
+            assistantText: lastAssistantText,
+            rule: correctionRule(text) ?? undefined,
+          });
+          log(`correction recorded: ${id}`);
+        } catch (error) {
+          log(`correction failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
       void observeText(text);
     });
     log('session/event listener attached');
