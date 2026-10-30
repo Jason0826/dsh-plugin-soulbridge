@@ -204,3 +204,51 @@ test('pre-step: rejected decisions are left alone', async () => {
   assert.deepEqual(result, { kind: 'reject' });
   assert.equal(called, false, 'no lookup when the step is not entered');
 });
+
+test('correction: 结构层能记录没有"错了"字样的纠正', () => {
+  const harness = fakeCtx();
+  apply(harness.ctx);
+  const listener = harness.listener;
+
+  // 上一轮的回答：L2 拿它做对照
+  listener(
+    {},
+    {
+      type: 'assistant/message',
+      data: {
+        message: {
+          content: [{ type: 'text', text: '项目约定应放仓库的 steering 文件，soulbridge 不接管。' }],
+        },
+      },
+    },
+  );
+  // 用户否定这句话，但句子里没有任何"错了/不对"这类词
+  listener(
+    {},
+    {
+      type: 'user/message',
+      data: {
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: '这些steering不也是个人经验吗？为什么不能写进soulbridge？' }],
+      },
+    },
+  );
+
+  const log = readFileSync(join(home, 'plugin.log'), 'utf8');
+  assert.match(log, /correction recorded: .* layer=structural/);
+});
+
+test('correction: 不是纠正的消息不落证据', () => {
+  const before = readFileSync(join(home, 'plugin.log'), 'utf8').match(/correction recorded/g)?.length ?? 0;
+  const harness = fakeCtx();
+  apply(harness.ctx);
+  harness.listener(
+    {},
+    {
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: '看一下当前数据情况呢' }] },
+    },
+  );
+  const after = readFileSync(join(home, 'plugin.log'), 'utf8').match(/correction recorded/g)?.length ?? 0;
+  assert.equal(after, before, '普通提问不该记成纠正');
+});

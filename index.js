@@ -14,7 +14,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { openSqlite, ensureConfig, resolveDbPath, Soul, isCorrection, correctionRule } from 'soulbridge';
+import { openSqlite, ensureConfig, resolveDbPath, Soul, detectCorrection } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
 export const inject = ['systemPrompt'];
@@ -538,16 +538,17 @@ export function apply(ctx) {
       if (kind !== 'user') return;
       if (text.length === 0) return;
 
-      // Evidence, not memory (RFC 0003 phase A): a correction is recorded with
-      // the reply it targeted, untouched, and never injected.
-      if (isCorrection(text)) {
+      // Evidence, not memory (RFC 0003 phase A), recorded with the reply it targeted.
+      // Two layers: explicit markers (L1) first, then structure against that reply (L2).
+      const verdict = detectCorrection(text, lastAssistantText);
+      if (verdict.isCorrection) {
         try {
           const id = ensureSoul().recordCorrection({
             userText: text,
             assistantText: lastAssistantText,
-            rule: correctionRule(text) ?? undefined,
+            rule: verdict.marker ? `${verdict.layer}:${verdict.marker}` : verdict.layer,
           });
-          log(`correction recorded: ${id}`);
+          log(`correction recorded: ${id} layer=${verdict.layer} marker=${verdict.marker ?? '-'}`);
         } catch (error) {
           log(`correction failed: ${error instanceof Error ? error.message : String(error)}`);
         }
