@@ -257,6 +257,27 @@ function textOf(content) {
 }
 
 /**
+ * Block inventory of one assistant message, for measuring what a reply really
+ * contains. Types, sizes and tool names only — never the text itself.
+ */
+export function summarizeBlocks(content) {
+  if (!Array.isArray(content)) return [];
+  return content.map((block) => {
+    const type = typeof block?.type === 'string' ? block.type : '?';
+    const entry = { type };
+    if (typeof block?.text === 'string') entry.chars = block.text.length;
+    if (typeof block?.reasoning === 'string') entry.chars = block.reasoning.length;
+    const name = block?.name ?? block?.toolName ?? block?.tool?.name;
+    if (typeof name === 'string') entry.name = name;
+    if (block?.arguments !== undefined) {
+      const raw = typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments);
+      entry.argsChars = raw.length;
+    }
+    return entry;
+  });
+}
+
+/**
  * Exchanges ranked against the current message, for the pre-step injection.
  *
  * Source is `turn_pairs`, not `memories`: one question and one answer is the
@@ -670,6 +691,11 @@ export function apply(ctx) {
           turn: event.data?.turn,
           step: event.data?.step,
           replyChars: reply.length,
+          // What the model actually returned, block by block: the turn is 5
+          // steps on average and 70% of turns call tools, so "one question one
+          // answer" is a product abstraction, not the model's shape. Types and
+          // sizes only — never the text.
+          blocks: summarizeBlocks(event.data?.message?.content),
           usage: event.data?.usage ?? null,
         });
         return;

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { apply, name, inject, textOf, VERSION, collectText, createPreStepHandler } = await import('../index.js');
+const { apply, name, inject, textOf, VERSION, collectText, createPreStepHandler, summarizeBlocks } = await import('../index.js');
 
 function fakeCtx() {
   const calls = [];
@@ -251,4 +251,15 @@ test('correction: 不是纠正的消息不落证据', () => {
   );
   const after = readFileSync(join(home, 'plugin.log'), 'utf8').match(/correction recorded/g)?.length ?? 0;
   assert.equal(after, before, '普通提问不该记成纠正');
+});test('summarizeBlocks: reports types, sizes and tool names only', () => {
+  const summary = summarizeBlocks([
+    { type: 'reasoning', reasoning: 'thinking...' },
+    { type: 'text', text: 'hello' },
+    { type: 'tool-call', name: 'functions.pwsh', arguments: '{"command":"ls"}' },
+  ]);
+  assert.deepEqual(summary, [
+    { type: 'reasoning', chars: 11 },
+    { type: 'text', chars: 5 },
+    { type: 'tool-call', name: 'functions.pwsh', argsChars: 16 },
+  ]);
 });
