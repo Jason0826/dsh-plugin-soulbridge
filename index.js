@@ -11,7 +11,7 @@
  * unhappy. What was injected, observed, or skipped is written to
  * ~/.soulbridge/plugin-state.json.
  */
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openSqlite, ensureConfig, resolveDbPath, Soul, detectCorrection } from 'soulbridge';
@@ -35,6 +35,31 @@ function logLlmRaw(raw) {
     appendFileSync(LLM_RAW_FILE, `${new Date().toISOString()} ${JSON.stringify(String(raw))}\n`);
   } catch (error) {
     log(`llm raw write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Structured trace (brief 0005): one jsonl line per decision, for reconciliation
+ * rather than reading. Never contains user text — ids, sizes and usage only.
+ *
+ * The first consumer is "is the context running away": a 134-turn session
+ * degenerated into repeated tokens and the database had no trace of it.
+ */
+const TRACE_FILE = join(HOME, 'trace.jsonl');
+const TRACE_MAX_BYTES = 10 * 1024 * 1024;
+
+function trace(record) {
+  if (readConfig().traceEnabled === false) return;
+  try {
+    mkdirSync(HOME, { recursive: true });
+    try {
+      if (statSync(TRACE_FILE).size > TRACE_MAX_BYTES) renameSync(TRACE_FILE, `${TRACE_FILE}.1`);
+    } catch {
+      // No file yet: nothing to rotate.
+    }
+    appendFileSync(TRACE_FILE, `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
+  } catch (error) {
+    log(`trace write failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -295,6 +320,7 @@ export function createPreStepHandler(deps) {
       };
       const idPart = used.length > 0 ? ` ids=[${used.join(',')}]` : '';
       log(`prestep: inject turn=${turn} chars=${block.length}${idPart}`);
+      trace({ event: 'inject', session: sessionId, turn, chars: block.length, ids: used });
       return { ...decision, messages: [...decision.messages, note] };
     } catch (error) {
       log(`prestep: skipped after error: ${error instanceof Error ? error.message : String(error)}`);
@@ -631,6 +657,16 @@ export function apply(ctx) {
           lastAssistantText = reply;
           noteAssistantPart(sessionId, reply);
         }
+        // Context size per request: the only number that can show whether a
+        // long session is running away (no user text, usage only).
+        trace({
+          event: 'message',
+          session: sessionId,
+          turn: event.data?.turn,
+          step: event.data?.step,
+          replyChars: reply.length,
+          usage: event.data?.usage ?? null,
+        });
         return;
       }
 
