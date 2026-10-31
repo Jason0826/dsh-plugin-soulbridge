@@ -304,9 +304,10 @@ export function createPreStepHandler(deps) {
 const pendingTurns = new Map();
 
 /**
- * The host emits turn/start, step/end and assistant/message — but no turn/end
- * (checked 2026-10-31 against the real event stream). So a reply is treated as
- * finished once no new assistant/message arrives for this long.
+ * Primary flush is the host's `turn/end` event. The silence timer below is only
+ * a fallback for the case where it never arrives (host bug, plugin reload mid
+ * turn): a reply is treated as finished once no new assistant/message arrives
+ * for this long.
  */
 const PAIR_FLUSH_DELAY_MS = 2000;
 const flushTimers = new Map();
@@ -626,9 +627,9 @@ export function apply(ctx) {
         return;
       }
 
-      // A new turn means the previous one is over. There is no turn/end event;
-      // the silence timer scheduled by noteAssistantPart is the primary flush.
-      if (type === 'turn/start') {
+      // A turn is over: write the pair. This is the primary flush point; the
+      // silence timer and the next user turn are fallbacks only.
+      if (type === 'turn/end') {
         flushTurnPair(sessionId);
         return;
       }
