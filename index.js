@@ -290,6 +290,11 @@ export function createPreStepHandler(deps) {
     const decision = await next();
     try {
       if (decision?.kind !== 'enter') return decision;
+      // Control switch for the A/B test: plugin-config.json { "injectEnabled": false }
+      if (readConfig().injectEnabled === false) {
+        log('prestep: inject disabled by config');
+        return decision;
+      }
       const messages = Array.isArray(payload?.messages) ? payload.messages : [];
       const text = textOf(messages[messages.length - 1]?.content);
       if (text.length === 0) return decision;
