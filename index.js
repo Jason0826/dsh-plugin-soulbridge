@@ -296,6 +296,55 @@ export function createPreStepHandler(deps) {
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * Turn pairs (RFC 0007): one exchange is the unit of memory.
+ * ------------------------------------------------------------------ */
+
+/** Exchanges awaiting turn/end: sessionId -> { turn, userText, at, assistantParts }. */
+const pendingTurns = new Map();
+
+function noteUserTurn(sessionId, event, text) {
+  pendingTurns.set(sessionId, {
+    turn: Number(event?.data?.turn ?? event?.seq ?? 0),
+    userText: text,
+    at: Number(event?.time ?? Date.now()),
+    assistantParts: [],
+  });
+}
+
+function noteAssistantPart(sessionId, text) {
+  const pending = pendingTurns.get(sessionId);
+  if (pending) pending.assistantParts.push(text);
+}
+
+/**
+ * Write the pending exchange. Called on turn/end and before the next user turn.
+ * No assistant text means the turn never completed — drop it rather than write a
+ * pair with an empty side (RFC 0007 §2.2: write less, never write half).
+ */
+function flushTurnPair(sessionId) {
+  const pending = pendingTurns.get(sessionId);
+  if (!pending) return;
+  pendingTurns.delete(sessionId);
+  if (pending.assistantParts.length === 0) {
+    log(`turn pair dropped (no reply) session=${sessionId} turn=${pending.turn}`);
+    return;
+  }
+  try {
+    ensureSoul().recordTurnPair({
+      sessionId,
+      turn: pending.turn,
+      userText: pending.userText,
+      assistantText: pending.assistantParts.join('\n'),
+      at: pending.at,
+    });
+    const chars = pending.userText.length + pending.assistantParts.join('').length;
+    log(`turn pair recorded session=${sessionId} turn=${pending.turn} chars=${chars}`);
+  } catch (error) {
+    log(`turn pair failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function observeText(text) {
   const started = Date.now();
   try {
@@ -534,10 +583,22 @@ export function apply(ctx) {
           ` sessionKeys=[${safeKeys(session)}]`,
       );
 
+      const sessionId = session?.id ?? 'default';
+
       // Keep the last reply: a correction only makes sense next to what it targets.
       if (type === 'assistant/message') {
         const reply = textOf(event.data?.message?.content);
-        if (reply.length > 0) lastAssistantText = reply;
+        if (reply.length > 0) {
+          lastAssistantText = reply;
+          noteAssistantPart(sessionId, reply);
+        }
+        return;
+      }
+
+      // The exchange is only complete at turn end: a streaming reply arrives in
+      // several assistant/message events, and writing on the first one stores half.
+      if (type === 'turn/end') {
+        flushTurnPair(sessionId);
         return;
       }
 
@@ -552,6 +613,11 @@ export function apply(ctx) {
       // messages arrive with their own source kinds and must not be observed.
       if (kind !== 'user') return;
       if (text.length === 0) return;
+
+      // A new user turn means the previous one never saw turn/end (interrupt,
+      // crash). Drop it rather than write a half pair.
+      flushTurnPair(sessionId);
+      noteUserTurn(sessionId, event, text);
 
       // Evidence, not memory (RFC 0003 phase A), recorded with the reply it targeted.
       // Two layers: explicit markers (L1) first, then structure against that reply (L2).
