@@ -226,7 +226,10 @@ function textOf(content) {
 /** Memories ranked against the current message, for the pre-step injection. */
 function buildRelatedContext(text) {
   const result = ensureSoul().context({ track: false, query: text, ...RELATED });
-  return result.text;
+  // `used` carries the injected memory ids. The log needs them: without ids an
+  // injection can never be reviewed after the fact, which is exactly why the
+  // S1 criterion "记忆真被用上" could not be sampled.
+  return { text: result.text, used: result.used ?? [] };
 }
 
 /**
@@ -254,7 +257,9 @@ export function createPreStepHandler(deps) {
       const turn = payload?.turn;
       if (injectedTurn.get(sessionId) === turn) return decision;
 
-      const block = deps.getContext(text);
+      const ctx = deps.getContext(text);
+      const block = typeof ctx === 'string' ? ctx : (ctx?.text ?? '');
+      const used = typeof ctx === 'string' ? [] : (ctx?.used ?? []);
       injectedTurn.set(sessionId, turn);
       if (injectedTurn.size > 16) {
         // Keep the map bounded: drop the oldest entry, not the newest.
@@ -272,7 +277,8 @@ export function createPreStepHandler(deps) {
         content: [{ type: 'text', text: block }],
         source: { kind: 'memory-context' },
       };
-      log(`prestep: inject turn=${turn} chars=${block.length}`);
+      const idPart = used.length > 0 ? ` ids=[${used.join(',')}]` : '';
+      log(`prestep: inject turn=${turn} chars=${block.length}${idPart}`);
       return { ...decision, messages: [...decision.messages, note] };
     } catch (error) {
       log(`prestep: skipped after error: ${error instanceof Error ? error.message : String(error)}`);
