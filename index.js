@@ -181,11 +181,15 @@ let cache = { text: '', at: 0 };
  */
 const ANCHOR = { types: ['strategy', 'fact', 'trait'], minImportance: 8, maxItems: 3 };
 /**
- * Related injections come from `turn_pairs` (RFC 0007): recent exchanges scored
- * against the current message. `maxChars` is a budget, not a truncation limit —
- * a pair that does not fit is skipped whole.
+ * Related injections come from `turn_pairs` (RFC 0007): every exchange scored
+ * against the current message, with no length or count cap.
+ *
+ * No cap on purpose. A long emotional exchange is exactly the thing worth
+ * remembering, so a character budget would systematically drop the important
+ * ones. Context limits are the host's problem (it compacts); ranking quality is
+ * ours. If injection grows too large later, sharpen the ranking or distill the
+ * pairs — do not go back to cutting length.
  */
-const RELATED = { maxItems: 5, maxChars: 1200 };
 
 /** Synchronous by necessity: PromptSection.text cannot return a promise. */
 function buildInjection() {
@@ -235,22 +239,13 @@ function textOf(content) {
  * system prompt keeps `memories` for now — anchors become the picture in MVP2.
  *
  * `used` carries the pair ids so an injection can be reviewed afterwards.
- * A pair that does not fit the character budget is skipped whole, never cut.
+ * Every related pair is injected, whatever its length.
  */
 function buildRelatedContext(text) {
-  const pairs = ensureSoul().recallTurnPairs(text, RELATED.maxItems);
-
-  let body = '';
-  const used = [];
-  for (const pair of pairs) {
-    const line = `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`;
-    const cost = body.length === 0 ? line.length : line.length + 1;
-    if (body.length + cost > RELATED.maxChars) continue;
-    body = body.length === 0 ? line : `${body}\n${line}`;
-    used.push(pair.id);
-  }
-  if (used.length === 0) return '';
-  return { text: `<memories>\n${body}\n</memories>`, used };
+  const pairs = ensureSoul().recallTurnPairs(text);
+  if (pairs.length === 0) return '';
+  const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
+  return { text: `<memories>\n${body}\n</memories>`, used: pairs.map((pair) => pair.id) };
 }
 
 /**
