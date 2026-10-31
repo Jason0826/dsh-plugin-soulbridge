@@ -180,8 +180,12 @@ let cache = { text: '', at: 0 };
  * cannot rank anything.
  */
 const ANCHOR = { types: ['strategy', 'fact', 'trait'], minImportance: 8, maxItems: 3 };
-/** Related memories: ranked against the current message inside agent/pre-step. */
-const RELATED = { types: ['strategy', 'fact', 'trait'], minImportance: 6, maxItems: 5 };
+/**
+ * Related injections come from `turn_pairs` (RFC 0007): recent exchanges scored
+ * against the current message. `maxChars` is a budget, not a truncation limit —
+ * a pair that does not fit is skipped whole.
+ */
+const RELATED = { maxItems: 5, maxChars: 1200 };
 
 /** Synchronous by necessity: PromptSection.text cannot return a promise. */
 function buildInjection() {
@@ -223,22 +227,30 @@ function textOf(content) {
     .trim();
 }
 
-/** Memories ranked against the current message, for the pre-step injection. */
+/**
+ * Exchanges ranked against the current message, for the pre-step injection.
+ *
+ * Source is `turn_pairs`, not `memories`: one question and one answer is the
+ * unit that can answer "what did we talk about last time" (RFC 0007). The
+ * system prompt keeps `memories` for now — anchors become the picture in MVP2.
+ *
+ * `used` carries the pair ids so an injection can be reviewed afterwards.
+ * A pair that does not fit the character budget is skipped whole, never cut.
+ */
 function buildRelatedContext(text) {
-  const result = ensureSoul().context({ track: false, query: text, ...RELATED });
-  // `used` carries the injected memory ids. The log needs them: without ids an
-  // injection can never be reviewed after the fact, which is exactly why the
-  // S1 criterion "记忆真被用上" could not be sampled.
-  //
-  // Two fixes over the first version:
-  //  - no selected memory means no injection. `result.text` is never empty (it
-  //    always carries <soul>), so the old `if (!block)` check never fired and
-  //    every turn with no match still injected an 88-char soul-only block.
-  //  - only <memories> is injected. <soul>/<style> already come from
-  //    systemPrompt.section; injecting them again duplicated them every turn.
-  if (result.used.length === 0) return '';
-  const block = result.text.match(/<memories>[\s\S]*?<\/memories>/);
-  return block ? { text: block[0], used: result.used } : '';
+  const pairs = ensureSoul().recallTurnPairs(text, RELATED.maxItems);
+
+  let body = '';
+  const used = [];
+  for (const pair of pairs) {
+    const line = `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`;
+    const cost = body.length === 0 ? line.length : line.length + 1;
+    if (body.length + cost > RELATED.maxChars) continue;
+    body = body.length === 0 ? line : `${body}\n${line}`;
+    used.push(pair.id);
+  }
+  if (used.length === 0) return '';
+  return { text: `<memories>\n${body}\n</memories>`, used };
 }
 
 /**
