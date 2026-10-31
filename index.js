@@ -300,8 +300,36 @@ export function createPreStepHandler(deps) {
  * Turn pairs (RFC 0007): one exchange is the unit of memory.
  * ------------------------------------------------------------------ */
 
-/** Exchanges awaiting turn/end: sessionId -> { turn, userText, at, assistantParts }. */
+/** Exchanges awaiting their reply to finish: sessionId -> { turn, userText, at, assistantParts }. */
 const pendingTurns = new Map();
+
+/**
+ * The host emits turn/start, step/end and assistant/message — but no turn/end
+ * (checked 2026-10-31 against the real event stream). So a reply is treated as
+ * finished once no new assistant/message arrives for this long.
+ */
+const PAIR_FLUSH_DELAY_MS = 2000;
+const flushTimers = new Map();
+
+function scheduleFlush(sessionId) {
+  const existing = flushTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  flushTimers.set(
+    sessionId,
+    setTimeout(() => {
+      flushTimers.delete(sessionId);
+      flushTurnPair(sessionId);
+    }, PAIR_FLUSH_DELAY_MS),
+  );
+}
+
+function cancelFlush(sessionId) {
+  const existing = flushTimers.get(sessionId);
+  if (existing) {
+    clearTimeout(existing);
+    flushTimers.delete(sessionId);
+  }
+}
 
 function noteUserTurn(sessionId, event, text) {
   pendingTurns.set(sessionId, {
@@ -314,15 +342,18 @@ function noteUserTurn(sessionId, event, text) {
 
 function noteAssistantPart(sessionId, text) {
   const pending = pendingTurns.get(sessionId);
-  if (pending) pending.assistantParts.push(text);
+  if (!pending) return;
+  pending.assistantParts.push(text);
+  scheduleFlush(sessionId);
 }
 
 /**
- * Write the pending exchange. Called on turn/end and before the next user turn.
- * No assistant text means the turn never completed — drop it rather than write a
- * pair with an empty side (RFC 0007 §2.2: write less, never write half).
+ * Write the pending exchange. Called after reply silence, before the next user
+ * turn, and on turn/start. No assistant text means the turn never completed —
+ * drop it rather than write a pair with an empty side (RFC 0007 §2.2).
  */
 function flushTurnPair(sessionId) {
+  cancelFlush(sessionId);
   const pending = pendingTurns.get(sessionId);
   if (!pending) return;
   pendingTurns.delete(sessionId);
@@ -595,9 +626,9 @@ export function apply(ctx) {
         return;
       }
 
-      // The exchange is only complete at turn end: a streaming reply arrives in
-      // several assistant/message events, and writing on the first one stores half.
-      if (type === 'turn/end') {
+      // A new turn means the previous one is over. There is no turn/end event;
+      // the silence timer scheduled by noteAssistantPart is the primary flush.
+      if (type === 'turn/start') {
         flushTurnPair(sessionId);
         return;
       }
