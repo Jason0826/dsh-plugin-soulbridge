@@ -229,7 +229,16 @@ function buildRelatedContext(text) {
   // `used` carries the injected memory ids. The log needs them: without ids an
   // injection can never be reviewed after the fact, which is exactly why the
   // S1 criterion "记忆真被用上" could not be sampled.
-  return { text: result.text, used: result.used ?? [] };
+  //
+  // Two fixes over the first version:
+  //  - no selected memory means no injection. `result.text` is never empty (it
+  //    always carries <soul>), so the old `if (!block)` check never fired and
+  //    every turn with no match still injected an 88-char soul-only block.
+  //  - only <memories> is injected. <soul>/<style> already come from
+  //    systemPrompt.section; injecting them again duplicated them every turn.
+  if (result.used.length === 0) return '';
+  const block = result.text.match(/<memories>[\s\S]*?<\/memories>/);
+  return block ? { text: block[0], used: result.used } : '';
 }
 
 /**
