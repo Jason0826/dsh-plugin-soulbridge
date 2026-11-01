@@ -79,6 +79,8 @@ const CONFIG_DEFAULTS = {
   provider: 'deepseek-account',
   model: 'deepseek-flash',
   maxLlmChars: 2000,
+  /** off | rules | llm — who writes entities/facts from a finished turn (ADR 0029). */
+  extract: 'llm',
 };
 
 function readConfig() {
@@ -431,8 +433,54 @@ function flushTurnPair(sessionId) {
     });
     const chars = pending.userText.length + pending.assistantParts.join('').length;
     log(`turn pair recorded session=${sessionId} turn=${pending.turn} chars=${chars}`);
+    // Extraction reads the finished turn, not the live one: it needs the full
+    // exchange, and it runs after the write so a model failure cannot block it.
+    void runExtraction(pending.userText, `tn_${sessionId}_${pending.turn}`, pending.turn);
   } catch (error) {
     log(`turn pair failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Turn text → entities, facts, gaps (ADR 0029).
+ *
+ * The model extracts and the code is the floor: without a model it falls back
+ * to rules, and either way the drafts go through commitDrafts' gate before
+ * anything is written. Failures are logged and never propagated — a broken
+ * extraction must not break the turn.
+ */
+async function runExtraction(text, turnId, turnNo) {
+  const config = readConfig();
+  if (config.extract === 'off') return;
+  if (typeof text !== 'string' || text.trim().length < 4) return;
+  const started = Date.now();
+  try {
+    const useLlm = config.extract === 'llm' && Boolean(injectedLlm);
+    const draft = await ensureSoul().extract(text, {
+      llm: useLlm ? injectedLlm : undefined,
+      mode: useLlm ? 'auto' : 'rules',
+    });
+    const result = ensureSoul().commitDrafts(draft, { turnId });
+    const ms = Date.now() - started;
+    log(
+      `extract ok: by=${draft.by} entities=${result.entities.length} facts=${result.facts.length}` +
+        ` gaps=${result.gaps.length} skipped=${result.skipped.length} ms=${ms} turn=${turnNo}`,
+    );
+    for (const skipped of result.skipped.slice(0, 3)) {
+      log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
+    }
+    trace({
+      event: 'extract',
+      turn: turnNo,
+      by: draft.by,
+      entities: result.entities.length,
+      facts: result.facts.length,
+      gaps: result.gaps.length,
+      skipped: result.skipped,
+      ms,
+    });
+  } catch (error) {
+    log(`extract failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
