@@ -672,9 +672,8 @@ export function apply(ctx) {
   injectedLlm = makeLlm(ctx, config);
   injectedMaxLlmChars = config.maxLlmChars;
   log(`distill=${config.distill}${injectedLlm ? ' via host model' : ' (rules only)'}`);
-  // Turns recorded before extraction existed are worth one pass; the marker
-  // keeps a restart from re-billing them.
-  void backfillExtraction();
+  // Backfill is triggered by the first user message, not here: at apply() time
+  // the host model service is not mounted yet and every call fails.
 
   try {
     ctx.effect(
@@ -800,6 +799,10 @@ export function apply(ctx) {
       const kind = data.source?.kind;
       const text = textOf(data.content);
       log(`user/message source=${kind ?? '?'} chars=${text.length}`);
+      // The model service is only mounted once the session is live, so the
+      // one-shot backfill waits for the first real message instead of running
+      // inside apply() where the llm lookup fails.
+      if (kind === 'user') void backfillExtraction();
 
       // Only the human's own prose. runtime-context / time-context / injected
       // messages arrive with their own source kinds and must not be observed.
