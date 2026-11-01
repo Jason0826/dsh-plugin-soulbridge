@@ -1061,9 +1061,55 @@ function detailTool() {
   };
 }
 
+/**
+ * Is this plugin on the profile's bundle list?
+ *
+ * A plugin is loaded only because its package is listed in `dsh.profile.bundles`.
+ * Desktop's fatal-error recovery (sanitizeProfile) renames cordis.patch.yml and
+ * restores a caller-given bundle list, which silently dropped this bundle once:
+ * the app stayed up, the plugin simply was not there, and the logs just stopped.
+ *
+ * The profile directory is derived from this module's own location
+ * (<profile>/node_modules/dsh-plugin-soulbridge/index.js), so it cannot drift
+ * from where the running copy actually is.
+ */
+export function checkBundle(manifest, name = 'dsh-plugin-soulbridge') {
+  const bundles = manifest?.dsh?.profile?.bundles;
+  if (!Array.isArray(bundles)) return { ok: false, reason: 'no dsh.profile.bundles list', bundles: [] };
+  return { ok: bundles.includes(name), reason: bundles.includes(name) ? 'present' : 'missing', bundles };
+}
+
+function selfCheck() {
+  try {
+    const pluginDir = fileURLToPath(new URL('.', import.meta.url));
+    const profileDir = resolve(pluginDir, '..', '..');
+    const manifestFile = join(profileDir, 'package.json');
+    if (!existsSync(manifestFile)) {
+      log(`bundle check: no profile manifest at ${manifestFile}`);
+      return;
+    }
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    const result = checkBundle(manifest);
+    if (result.ok) {
+      log(`bundle check: present (profile=${profileDir})`);
+      return;
+    }
+    log(
+      `bundle check: MISSING from dsh.profile.bundles (profile=${profileDir}) — ` +
+        `add "${name}" to that list or this plugin will not load after a restart`,
+    );
+    trace({ event: 'bundle-missing', profile: profileDir, bundles: result.bundles });
+    writeState({ bundleMissing: true, bundleCheckedAt: Date.now(), profile: profileDir });
+  } catch (error) {
+    log(`bundle check: failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
   writeState({ appliedAt: Date.now(), version: VERSION });
+  selfCheck();
+
 
   const config = readConfig();
   injectedLlm = makeLlm(ctx, config);
