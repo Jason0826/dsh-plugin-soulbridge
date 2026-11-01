@@ -17,7 +17,7 @@ mkdirSync(join(home), { recursive: true });
 
 const { openSqlite } = await import('soulbridge');
 const { Soul } = await import('soulbridge');
-const { buildFactHooks } = await import('../index.js');
+const { buildFactHooks, mentions } = await import('../index.js');
 
 const store = openSqlite(join(home, 'soul.db'));
 const soul = new Soul({ store, soulId: 'xiaoling', userId: 'local' });
@@ -65,4 +65,17 @@ test.after(() => {
   } catch {
     /* ignore */
   }
+});
+
+test('mentions: a one-letter Latin name needs word boundaries', () => {
+  const entity = { name: 'a', aliases: [] };
+  assert.equal(mentions('chat 里那套 data 方案', entity), false, 'letters inside words must not match');
+  assert.equal(mentions('跟 a 刚认识的时候', entity), true);
+  assert.equal(mentions('A 还好吗', entity), true, 'case-insensitive');
+});
+
+test('mentions: CJK names match as substrings, one character is skipped', () => {
+  assert.equal(mentions('我今天问了用户一件事', { name: '用户', aliases: [] }), true);
+  assert.equal(mentions('随便说说', { name: '妈', aliases: [] }), false, 'single CJK char is too ambiguous');
+  assert.equal(mentions('阿珍最近怎么样', { name: '珍', aliases: ['阿珍'] }), true, 'an alias can carry it');
 });

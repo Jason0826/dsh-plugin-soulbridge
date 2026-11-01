@@ -317,16 +317,35 @@ export function summarizeBlocks(content) {
  * that person's timeline ends: the earliest fact (how it started) and the most
  * recent ones (where it stands).
  */
+const LATIN_NAME = /[a-z0-9]/i;
+
+/**
+ * Does this message name the entity?
+ *
+ * A plain `includes` is wrong for short Latin names: an entity called "a" would
+ * match "chat", "data" and every English word. Latin names need boundaries; CJK
+ * names of two or more characters are matched as substrings, and a one-character
+ * CJK name is skipped rather than guessed.
+ */
+export function mentions(text, entity) {
+  const names = [entity?.name, ...(Array.isArray(entity?.aliases) ? entity.aliases : [])].filter(Boolean);
+  for (const name of names) {
+    if (LATIN_NAME.test(name)) {
+      const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(text)) return true;
+      continue;
+    }
+    if (name.length >= 2 && text.includes(name)) return true;
+  }
+  return false;
+}
+
 export function buildFactHooks(text) {
   const parts = [];
   const used = [];
   try {
     const known = ensureSoul().findEntities('', 50);
-    const mentioned = known.filter(
-      (entity) =>
-        text.includes(entity.name) ||
-        (Array.isArray(entity.aliases) && entity.aliases.some((alias) => text.includes(alias))),
-    );
+    const mentioned = known.filter((entity) => mentions(text, entity));
     for (const entity of mentioned.slice(0, 3)) {
       const earliest = ensureSoul().factsAbout(entity.id, { order: 'asc', limit: 1 });
       const recent = ensureSoul().factsAbout(entity.id, { limit: 4 });
