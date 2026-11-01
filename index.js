@@ -475,6 +475,14 @@ export function createPreStepHandler(deps) {
         log('prestep: inject disabled by config');
         return decision;
       }
+      // Topics the conversation has moved past, closed once per turn. Pure
+      // arithmetic on turn numbers — no model, so it cannot fail softly.
+      try {
+        const closed = ensureSoul().closeIdleThreads(Number(payload?.turn ?? 0), 6, Date.now());
+        if (closed.length > 0) log(`threads closed: ${closed.join(',')}`);
+      } catch (error) {
+        log(`threads close failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const messages = Array.isArray(payload?.messages) ? payload.messages : [];
       const text = textOf(messages[messages.length - 1]?.content);
       if (text.length === 0) return decision;
