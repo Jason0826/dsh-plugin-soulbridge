@@ -645,15 +645,30 @@ async function runExtraction(text, turnId, turnNo) {
   const started = Date.now();
   try {
     const useLlm = config.extract === 'llm' && Boolean(injectedLlm);
-    const draft = await ensureSoul().extract(text, {
+    const soul = ensureSoul();
+    const draft = await soul.extract(text, {
       llm: useLlm ? injectedLlm : undefined,
       mode: useLlm ? 'auto' : 'rules',
+      // The extractor needs the open threads so it can say which one this turn
+      // continues, and how long ago each was last seen.
+      context: soul.extractionContext(20, { turnNo }),
     });
-    const result = ensureSoul().commitDrafts(draft, { turnId });
+    const result = soul.commitDrafts(draft, { turnId });
+    // Attribution is written even when nothing was extracted: a turn that says
+    // "无" (nothing worth remembering) can still be part of a thread.
+    const turnRow = soul.turn(turnId);
+    const attribution = soul.applyThread(draft.thread, {
+      sessionId: turnRow?.sessionId ?? 'unknown',
+      turnNo,
+      turnId,
+      at: Date.now(),
+      fallbackTopic: text.slice(0, 20),
+    });
     const ms = Date.now() - started;
     log(
       `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
-        ` gaps=${result.gaps.length} skipped=${result.skipped.length} ms=${ms} turn=${turnNo}`,
+        ` gaps=${result.gaps.length} skipped=${result.skipped.length} ms=${ms} turn=${turnNo}` +
+        ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -667,6 +682,9 @@ async function runExtraction(text, turnId, turnNo) {
       facts: result.facts.length,
       gaps: result.gaps.length,
       skipped: result.skipped,
+      thread: attribution.threadId,
+      threadCreated: attribution.created,
+      threadTopic: attribution.topic,
       ms,
     });
     // Rules mode is a deliberate configuration, not a failed model call.
