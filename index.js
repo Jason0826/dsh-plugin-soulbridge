@@ -11,7 +11,7 @@
  * unhappy. What was injected, observed, or skipped is written to
  * ~/.soulbridge/plugin-state.json.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openSqlite, ensureConfig, resolveDbPath, Soul, detectCorrection } from 'soulbridge';
@@ -442,17 +442,25 @@ function flushTurnPair(sessionId) {
 }
 
 /**
- * Turn text → entities, facts, gaps (ADR 0029).
+ * Does this message carry anything worth extracting?
  *
- * The model extracts and the code is the floor: without a model it falls back
- * to rules, and either way the drafts go through commitDrafts' gate before
- * anything is written. Failures are logged and never propagated — a broken
- * extraction must not break the turn.
+ * Length alone is the wrong test: "做" and "重来" are one and two characters and
+ * are real decisions. Only pure acknowledgements are skipped, and a skip is
+ * always logged — a silent skip is how the pipeline looked dead for an hour.
  */
+function hasSubstance(text) {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+  return !/^(好的?|嗯+|哦+|可以|行|ok|okay|收到|明白|继续|好)[。！!.\s]*$/i.test(trimmed);
+}
+
 async function runExtraction(text, turnId, turnNo) {
   const config = readConfig();
   if (config.extract === 'off') return;
-  if (typeof text !== 'string' || text.trim().length < 4) return;
+  if (typeof text !== 'string' || !hasSubstance(text)) {
+    log(`extract skipped: no substance (chars=${typeof text === 'string' ? text.length : -1}) turn=${turnNo}`);
+    return;
+  }
   const started = Date.now();
   try {
     const useLlm = config.extract === 'llm' && Boolean(injectedLlm);
@@ -481,6 +489,33 @@ async function runExtraction(text, turnId, turnNo) {
     });
   } catch (error) {
     log(`extract failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * One-shot backfill: extract the last few completed turns that existed before
+ * extraction was wired. Runs at most once (marker file), so a restart never
+ * re-bills old turns.
+ */
+async function backfillExtraction() {
+  const marker = join(HOME, '.extract-backfill-done');
+  if (existsSync(marker)) return;
+  const config = readConfig();
+  if (config.extract === 'off') return;
+  try {
+    const recent = ensureSoul().recallTurnPairs('', 5);
+    if (recent.length === 0) {
+      writeFileSync(marker, new Date().toISOString());
+      return;
+    }
+    log(`extract backfill: ${recent.length} turns`);
+    for (const turn of recent) {
+      await runExtraction(turn.userText, `tn_${turn.sessionId}_${turn.turn}`, turn.turn);
+    }
+    writeFileSync(marker, new Date().toISOString());
+    log('extract backfill done');
+  } catch (error) {
+    log(`extract backfill failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -637,6 +672,9 @@ export function apply(ctx) {
   injectedLlm = makeLlm(ctx, config);
   injectedMaxLlmChars = config.maxLlmChars;
   log(`distill=${config.distill}${injectedLlm ? ' via host model' : ' (rules only)'}`);
+  // Turns recorded before extraction existed are worth one pass; the marker
+  // keeps a restart from re-billing them.
+  void backfillExtraction();
 
   try {
     ctx.effect(
