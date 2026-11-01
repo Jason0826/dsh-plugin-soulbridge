@@ -479,7 +479,12 @@ export function createPreStepHandler(deps) {
       // arithmetic on turn numbers — no model, so it cannot fail softly.
       try {
         const closed = ensureSoul().closeIdleThreads(Number(payload?.turn ?? 0), 6, Date.now());
-        if (closed.length > 0) log(`threads closed: ${closed.join(',')}`);
+        if (closed.length > 0) {
+          log(`threads closed: ${closed.join(',')}`);
+          // A closed thread is the unit consolidation runs on — never a batch of
+          // facts, which can mix two topics into one conclusion.
+          enqueueConsolidation(closed);
+        }
       } catch (error) {
         log(`threads close failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -777,17 +782,50 @@ export async function drainExtractionQueue() {
  * ------------------------------------------------------------------ */
 
 const CONSOLIDATION_FILE = join(HOME, 'consolidation.json');
-/** How many new observations make a batch worth consolidating. */
-const CONSOLIDATION_BATCH = 5;
+/** Closed threads waiting to be consolidated, oldest first. */
+const CONSOLIDATION_QUEUE_FILE = join(HOME, 'pending-threads.json');
 const CONSOLIDATION_MAX_FACTS = 8;
 
 function readConsolidationState() {
   try {
     const raw = JSON.parse(readFileSync(CONSOLIDATION_FILE, 'utf8'));
-    return { lastCount: Number(raw?.lastCount ?? 0), pending: raw?.pending ?? null };
+    return { pending: raw?.pending ?? null };
   } catch {
-    return { lastCount: 0, pending: null };
+    return { pending: null };
   }
+}
+
+function readConsolidationQueue() {
+  try {
+    const raw = JSON.parse(readFileSync(CONSOLIDATION_QUEUE_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeConsolidationQueue(queue) {
+  try {
+    writeFileSync(CONSOLIDATION_QUEUE_FILE, JSON.stringify(queue.slice(0, 50), null, 2), 'utf8');
+  } catch (error) {
+    log(`consolidate queue write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function enqueueConsolidation(threadIds) {
+  if (!Array.isArray(threadIds) || threadIds.length === 0) return;
+  const queue = readConsolidationQueue();
+  for (const id of threadIds) if (!queue.includes(id)) queue.push(id);
+  writeConsolidationQueue(queue);
+  log(`consolidate queued: ${threadIds.join(',')} pending=${queue.length}`);
+}
+
+function shiftConsolidationQueue() {
+  const queue = readConsolidationQueue();
+  if (queue.length === 0) return null;
+  const [first, ...rest] = queue;
+  writeConsolidationQueue(rest);
+  return first;
 }
 
 function writeConsolidationState(state) {
@@ -800,6 +838,10 @@ function writeConsolidationState(state) {
 
 /**
  * One consolidation step per call, never two model calls in one step.
+ *
+ * Consolidation runs on a **closed thread**, not on a batch of facts: a
+ * conversation still in progress is not a chapter yet, and a batch can mix two
+ * unrelated topics into one conclusion.
  *
  * The two phases are split across steps on purpose: the verifier must answer
  * without the draft's reasoning in view (Chain-of-Verification), and a second
@@ -815,55 +857,86 @@ async function runConsolidationStep() {
   const state = readConsolidationState();
 
   if (state.pending?.phase === 'verify') {
-    const { draft, batch } = state.pending;
+    const { draft, batch, threadId } = state.pending;
     const raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
     const verdict = parseVerificationDraft(raw) ?? { verdict: 'unsupported', reason: 'unparseable verdict' };
     if (verdict.verdict === 'supported') {
       const result = soul.recordConclusion(draft, { allowed: batch.map((fact) => fact.id) });
+      // The conclusion becomes the thread's summary; a closed thread with no
+      // summary is still closed, it just has nothing to remember it by.
+      if (result.ok && threadId) soul.store.closeThread(threadId, Date.now(), result.fact?.id);
       log(
-        `consolidate ok: "${draft.statement}" evidence=${draft.evidence.length} ` +
+        `consolidate ok: thread=${threadId ?? '-'} "${draft.statement}" evidence=${draft.evidence.length} ` +
           `written=${result.ok}${result.superseded ? ' superseded=1' : ''}`,
       );
-      trace({ event: 'consolidate', verdict: 'supported', ok: result.ok, reason: result.reason, statement: draft.statement });
+      trace({
+        event: 'consolidate',
+        verdict: 'supported',
+        ok: result.ok,
+        reason: result.reason,
+        statement: draft.statement,
+        thread: threadId,
+      });
     } else {
       // Partial support is dropped, not downgraded: a half-true conclusion is a
       // wrong one, and the sample is what teaches the prompt next time.
       log(`consolidate dropped: ${verdict.verdict} — "${draft.statement}" (${verdict.reason ?? '-'})`);
-      trace({ event: 'consolidate', verdict: verdict.verdict, dropped: true, reason: verdict.reason, statement: draft.statement });
+      trace({
+        event: 'consolidate',
+        verdict: verdict.verdict,
+        dropped: true,
+        reason: verdict.reason,
+        statement: draft.statement,
+        thread: threadId,
+      });
     }
-    writeConsolidationState({ lastCount: soul.factTotal(), pending: null });
+    writeConsolidationState({ pending: null });
     return true;
   }
 
-  const total = soul.factTotal();
-  if (total - state.lastCount < CONSOLIDATION_BATCH) return false;
+  const threadId = shiftConsolidationQueue();
+  if (!threadId) return false;
+  const context = soul.threadContext(threadId);
+  if (!context) {
+    log(`consolidate: thread ${threadId} missing, skipped`);
+    return true;
+  }
+  // Two citations are the floor for a conclusion; a thread with fewer facts is
+  // recorded as "not yet", not forced into a judgement.
+  if (context.facts.length < 2) {
+    log(`consolidate skipped: thread ${threadId} has ${context.facts.length} fact(s)`);
+    trace({ event: 'consolidate', verdict: 'too-few-facts', thread: threadId, facts: context.facts.length });
+    return true;
+  }
 
-  const batch = soul.recentFacts(CONSOLIDATION_MAX_FACTS).map((fact) => ({
+  const batch = context.facts.slice(0, CONSOLIDATION_MAX_FACTS).map((fact) => ({
     id: fact.id,
     statement: fact.statement,
     atText: fact.atText,
   }));
-  if (batch.length < 2) {
-    writeConsolidationState({ lastCount: total, pending: null });
-    return false;
-  }
-
   const raw = await injectedLlm(
     renderConsolidationPrompt({
       facts: batch,
       existing: soul.conclusions(5).map((fact) => ({ id: fact.id, statement: fact.statement })),
+      thread: {
+        topic: context.thread.topic,
+        turns: context.turns.map((turn) => {
+          const answer = turn.assistantText.replace(/\s+/g, ' ').slice(0, 120);
+          return `用户：${turn.userText.slice(0, 160)}${answer ? ` / 我：${answer}` : ''}`;
+        }),
+      },
     }),
   );
   const draft = parseConclusionDraft(raw);
   if (!draft) {
-    log(`consolidate: nothing to conclude from ${batch.length} facts`);
-    trace({ event: 'consolidate', verdict: 'none', batch: batch.length });
-    writeConsolidationState({ lastCount: total, pending: null });
+    log(`consolidate: nothing to conclude from thread ${threadId} (${batch.length} facts)`);
+    trace({ event: 'consolidate', verdict: 'none', thread: threadId, batch: batch.length });
+    writeConsolidationState({ pending: null });
     return true;
   }
-  log(`consolidate draft: "${draft.statement}" evidence=${draft.evidence.join(',')} — verifying next step`);
-  trace({ event: 'consolidate', verdict: 'draft', statement: draft.statement, evidence: draft.evidence });
-  writeConsolidationState({ lastCount: state.lastCount, pending: { phase: 'verify', draft, batch } });
+  log(`consolidate draft: thread=${threadId} "${draft.statement}" evidence=${draft.evidence.join(',')} — verifying next step`);
+  trace({ event: 'consolidate', verdict: 'draft', statement: draft.statement, evidence: draft.evidence, thread: threadId });
+  writeConsolidationState({ pending: { phase: 'verify', draft, batch, threadId } });
   return true;
 }
 
