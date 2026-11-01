@@ -1,0 +1,24 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      soulbridge:
+        specifier: file:D:/git-workspace/repos/soulbridge
+        version: file:../soulbridge
+
+packages:
+
+  soulbridge@file:../soulbridge:
+    resolution: {directory: ../soulbridge, type: directory}
+    engines: {node: '>=22.18'}
+    hasBin: true
+
+snapshots:
+
+  soulbridge@file:../soulbridge: {}

@@ -308,6 +308,48 @@ export function summarizeBlocks(content) {
  * `used` carries the pair ids so an injection can be reviewed afterwards.
  * Every related pair is injected, whatever its length.
  */
+/**
+ * The cheapest possible memory: one line per fact, with the id needed to expand.
+ *
+ * Injection should not replay whole conversations — that decides for the model
+ * what is worth reading. It should say "this happened", and leave the detail
+ * behind `soul_detail`. When the current message names someone we know, we send
+ * that person's timeline ends: the earliest fact (how it started) and the most
+ * recent ones (where it stands).
+ */
+export function buildFactHooks(text) {
+  const parts = [];
+  const used = [];
+  try {
+    const known = ensureSoul().findEntities('', 50);
+    const mentioned = known.filter(
+      (entity) =>
+        text.includes(entity.name) ||
+        (Array.isArray(entity.aliases) && entity.aliases.some((alias) => text.includes(alias))),
+    );
+    for (const entity of mentioned.slice(0, 3)) {
+      const earliest = ensureSoul().factsAbout(entity.id, { order: 'asc', limit: 1 });
+      const recent = ensureSoul().factsAbout(entity.id, { limit: 4 });
+      const seen = new Set();
+      const lines = [];
+      for (const fact of [...earliest, ...recent]) {
+        if (seen.has(fact.id)) continue;
+        seen.add(fact.id);
+        const when = fact.atText ?? (fact.at ? new Date(fact.at).toISOString().slice(0, 10) : '');
+        lines.push(`- [${fact.id}] ${fact.statement}${when ? `（${when}）` : ''}`);
+        used.push(fact.id);
+      }
+      if (lines.length > 0) {
+        parts.push(`<about name="${entity.name}">\n${lines.join('\n')}\n</about>`);
+      }
+    }
+  } catch (error) {
+    log(`prestep: hooks failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (parts.length === 0) return '';
+  return { text: parts.join('\n\n'), used };
+}
+
 function buildRelatedContext(text) {
   const parts = [];
   const used = [];
@@ -326,6 +368,11 @@ function buildRelatedContext(text) {
     }
   } catch (error) {
     log(`prestep: anchors failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const hooks = buildFactHooks(text);
+  if (hooks && hooks.text) {
+    parts.push(hooks.text);
+    used.push(...hooks.used);
   }
   const pairs = ensureSoul().recallTurnPairs(text);
   if (pairs.length > 0) {
@@ -705,6 +752,60 @@ function rememberTool() {
   };
 }
 
+function detailTool() {
+  return {
+    name: 'soul_detail',
+    description:
+      '按事实 id 取回当时的完整对话。注入里每条记忆是形如 [fc_xxx] 的一句话；' +
+      '只有需要原话、细节或上下文时才调用它——先看一句话就能回答的问题，不要调用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '事实 id，例如 fc_ab12' },
+      },
+      required: ['id'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          statement: { type: 'string' },
+          at: { type: 'number' },
+          atText: { type: 'string' },
+          userText: { type: 'string' },
+          assistantText: { type: 'string' },
+          reason: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render: textRender,
+    },
+    async execute(args) {
+      try {
+        const id = String(args?.id ?? '').trim();
+        const detail = ensureSoul().factDetail(id);
+        if (!detail) {
+          log(`tool soul_detail: miss ${id}`);
+          return { ok: false, reason: `no fact ${id}` };
+        }
+        log(`tool soul_detail: ${id} turn=${detail.turn ? 'yes' : 'no'}`);
+        return {
+          ok: true,
+          statement: detail.fact.statement,
+          at: detail.fact.at,
+          atText: detail.fact.atText,
+          userText: detail.turn?.userText,
+          assistantText: detail.turn?.assistantText,
+        };
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  };
+}
+
 export function apply(ctx) {
   log(`apply() called (v${VERSION})`);
   writeState({ appliedAt: Date.now(), version: VERSION });
@@ -770,8 +871,8 @@ export function apply(ctx) {
           log('tools: service unavailable; disabled');
           return;
         }
-        const disposers = [tools.register(recallTool()), tools.register(rememberTool())];
-        log('tools registered (soul_recall, soul_remember)');
+        const disposers = [tools.register(recallTool()), tools.register(rememberTool()), tools.register(detailTool())];
+        log('tools registered (soul_recall, soul_remember, soul_detail)');
         ctx.effect(() => () => {
           for (const dispose of disposers) {
             try {
