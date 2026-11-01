@@ -420,6 +420,10 @@ export function createPreStepHandler(deps) {
     const decision = await next();
     try {
       if (decision?.kind !== 'enter') return decision;
+      // We are inside a live turn now, which is the only place the host model is
+      // callable. Drain queued turns first, without awaiting: extraction must
+      // never delay the user's reply.
+      void drainExtractionQueue();
       // Control switch for the A/B test: plugin-config.json { "injectEnabled": false }
       if (readConfig().injectEnabled === false) {
         log('prestep: inject disabled by config');
@@ -540,12 +544,45 @@ function flushTurnPair(sessionId) {
     });
     const chars = pending.userText.length + pending.assistantParts.join('').length;
     log(`turn pair recorded session=${sessionId} turn=${pending.turn} chars=${chars}`);
-    // Extraction reads the finished turn, not the live one: it needs the full
-    // exchange, and it runs after the write so a model failure cannot block it.
-    void runExtraction(pending.userText, `tn_${sessionId}_${pending.turn}`, pending.turn);
+    // Extraction is queued, not run here: outside a live turn the host model is
+    // not callable (every attempt returned an empty stream today). The queue is
+    // drained at the start of the next turn, which is inside one.
+    enqueueExtraction(`tn_${sessionId}_${pending.turn}`, pending.turn);
   } catch (error) {
     log(`turn pair failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Extraction queue: written at turn end, drained inside the next turn
+ * ------------------------------------------------------------------ */
+
+const EXTRACT_QUEUE_FILE = join(HOME, 'pending-extract.json');
+const EXTRACT_MAX_ATTEMPTS = 3;
+
+function readExtractQueue() {
+  try {
+    const raw = JSON.parse(readFileSync(EXTRACT_QUEUE_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeExtractQueue(queue) {
+  try {
+    writeFileSync(EXTRACT_QUEUE_FILE, JSON.stringify(queue.slice(0, 50), null, 2), 'utf8');
+  } catch (error) {
+    log(`extract queue write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function enqueueExtraction(turnId, turnNo) {
+  const queue = readExtractQueue();
+  if (queue.some((item) => item.turnId === turnId)) return;
+  queue.push({ turnId, turnNo, attempts: 0 });
+  writeExtractQueue(queue);
+  log(`extract queued turn=${turnNo} pending=${queue.length}`);
 }
 
 /**
@@ -563,10 +600,10 @@ function hasSubstance(text) {
 
 async function runExtraction(text, turnId, turnNo) {
   const config = readConfig();
-  if (config.extract === 'off') return;
+  if (config.extract === 'off') return 'skipped-off';
   if (typeof text !== 'string' || !hasSubstance(text)) {
     log(`extract skipped: no substance (chars=${typeof text === 'string' ? text.length : -1}) turn=${turnNo}`);
-    return;
+    return 'skipped-empty';
   }
   const started = Date.now();
   try {
@@ -588,21 +625,71 @@ async function runExtraction(text, turnId, turnNo) {
       event: 'extract',
       turn: turnNo,
       by: draft.by,
+      reason: draft.reason,
       entities: result.entities.length,
       facts: result.facts.length,
       gaps: result.gaps.length,
       skipped: result.skipped,
       ms,
     });
+    return draft.by === 'llm' ? 'ok' : `rules:${draft.reason ?? 'unknown'}`;
   } catch (error) {
     log(`extract failed: ${error instanceof Error ? error.message : String(error)}`);
+    return `failed:${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+let draining = false;
+
+/**
+ * Drain the extraction queue inside a live turn.
+ *
+ * The host model is only callable while a turn is running, so the queue exists:
+ * turns are written at the end of one and extracted at the start of the next.
+ * A failure keeps the item for a retry; three failures drop it with the reason.
+ */
+async function drainExtractionQueue() {
+  if (draining) return;
+  const config = readConfig();
+  if (config.extract === 'off') return;
+  const queue = readExtractQueue();
+  if (queue.length === 0) return;
+  draining = true;
+  try {
+    const remaining = [];
+    for (const item of queue.slice(0, 5)) {
+      let text = '';
+      try {
+        const turn = ensureSoul().turn(item.turnId);
+        text = turn?.userText ?? '';
+      } catch {
+        text = '';
+      }
+      if (!text) {
+        log(`extract queue: turn ${item.turnId} missing, dropped`);
+        continue;
+      }
+      const outcome = await runExtraction(text, item.turnId, item.turnNo);
+      if (outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome.startsWith('rules:')) {
+        continue;
+      }
+      const attempts = (item.attempts ?? 0) + 1;
+      if (attempts >= EXTRACT_MAX_ATTEMPTS) {
+        log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
+        continue;
+      }
+      remaining.push({ ...item, attempts });
+    }
+    writeExtractQueue([...remaining, ...queue.slice(5)]);
+    trace({ event: 'extract-queue', drained: queue.slice(0, 5).length, remaining: remaining.length });
+  } finally {
+    draining = false;
   }
 }
 
 /**
- * One-shot backfill: extract the last few completed turns that existed before
- * extraction was wired. Runs at most once (marker file), so a restart never
- * re-bills old turns.
+ * One-shot backfill: enqueue the last few completed turns so they go through the
+ * same path as new ones. Marker file keeps a restart from re-billing old turns.
  */
 async function backfillExtraction() {
   const marker = join(HOME, '.extract-backfill-done');
@@ -611,16 +698,11 @@ async function backfillExtraction() {
   if (config.extract === 'off') return;
   try {
     const recent = ensureSoul().recallTurnPairs('', 5);
-    if (recent.length === 0) {
-      writeFileSync(marker, new Date().toISOString());
-      return;
-    }
-    log(`extract backfill: ${recent.length} turns`);
+    log(`extract backfill: queued ${recent.length} turns`);
     for (const turn of recent) {
-      await runExtraction(turn.userText, `tn_${turn.sessionId}_${turn.turn}`, turn.turn);
+      enqueueExtraction(`tn_${turn.sessionId}_${turn.turn}`, turn.turn);
     }
     writeFileSync(marker, new Date().toISOString());
-    log('extract backfill done');
   } catch (error) {
     log(`extract backfill failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -963,7 +1045,9 @@ export function apply(ctx) {
       // The model service is only mounted once the session is live, so the
       // one-shot backfill waits for the first real message instead of running
       // inside apply() where the llm lookup fails.
-      if (kind === 'user') void backfillExtraction();
+      if (kind === 'user') {
+        void backfillExtraction();
+      }
 
       // Only the human's own prose. runtime-context / time-context / injected
       // messages arrive with their own source kinds and must not be observed.
