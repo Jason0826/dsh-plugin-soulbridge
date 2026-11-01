@@ -14,7 +14,17 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { openSqlite, ensureConfig, resolveDbPath, Soul, detectCorrection } from 'soulbridge';
+import {
+  openSqlite,
+  ensureConfig,
+  resolveDbPath,
+  Soul,
+  detectCorrection,
+  renderConsolidationPrompt,
+  renderVerificationPrompt,
+  parseConclusionDraft,
+  parseVerificationDraft,
+} from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
 export const inject = ['systemPrompt'];
@@ -450,9 +460,16 @@ export function createPreStepHandler(deps) {
     try {
       if (decision?.kind !== 'enter') return decision;
       // We are inside a live turn now, which is the only place the host model is
-      // callable. Drain queued turns first, without awaiting: extraction must
-      // never delay the user's reply.
-      void drainExtractionQueue();
+      // callable. Extraction first, consolidation only if extraction had nothing:
+      // one model call per step keeps every call inside that window.
+      void (async () => {
+        try {
+          const extracted = await drainExtractionQueue();
+          if (!extracted) await runConsolidationStep();
+        } catch (error) {
+          log(`background: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      })();
       // Control switch for the A/B test: plugin-config.json { "injectEnabled": false }
       if (readConfig().injectEnabled === false) {
         log('prestep: inject disabled by config');
@@ -710,7 +727,7 @@ export async function drainExtractionQueue() {
     if (ok) {
       writeExtractQueue(rest);
       trace({ event: 'extract-queue', drained: 1, remaining: rest.length, outcome });
-      return;
+      return true;
     }
 
     // A rules result caused by a broken model call is not a completed extraction.
@@ -718,14 +735,110 @@ export async function drainExtractionQueue() {
     if (attempts >= EXTRACT_MAX_ATTEMPTS) {
       log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
       writeExtractQueue(rest);
-      return;
+      return true;
     }
     log(`extract queue: retry turn=${item.turnNo} attempt=${attempts} (${outcome})`);
     writeExtractQueue([{ ...item, attempts }, ...rest]);
     trace({ event: 'extract-queue', drained: 1, remaining: rest.length + 1, outcome, retry: true });
+    return true;
   } finally {
     draining = false;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Consolidation: observations → one conclusion, checked before it lands
+ * ------------------------------------------------------------------ */
+
+const CONSOLIDATION_FILE = join(HOME, 'consolidation.json');
+/** How many new observations make a batch worth consolidating. */
+const CONSOLIDATION_BATCH = 5;
+const CONSOLIDATION_MAX_FACTS = 8;
+
+function readConsolidationState() {
+  try {
+    const raw = JSON.parse(readFileSync(CONSOLIDATION_FILE, 'utf8'));
+    return { lastCount: Number(raw?.lastCount ?? 0), pending: raw?.pending ?? null };
+  } catch {
+    return { lastCount: 0, pending: null };
+  }
+}
+
+function writeConsolidationState(state) {
+  try {
+    writeFileSync(CONSOLIDATION_FILE, JSON.stringify(state, null, 2), 'utf8');
+  } catch (error) {
+    log(`consolidate: state write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * One consolidation step per call, never two model calls in one step.
+ *
+ * The two phases are split across steps on purpose: the verifier must answer
+ * without the draft's reasoning in view (Chain-of-Verification), and a second
+ * call in the same step would run past the window where the host model is
+ * callable anyway.
+ *
+ * Returns true when a model call was made, so the caller can skip other work.
+ */
+async function runConsolidationStep() {
+  const config = readConfig();
+  if (config.extract === 'off' || !injectedLlm) return false;
+  const soul = ensureSoul();
+  const state = readConsolidationState();
+
+  if (state.pending?.phase === 'verify') {
+    const { draft, batch } = state.pending;
+    const raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
+    const verdict = parseVerificationDraft(raw) ?? { verdict: 'unsupported', reason: 'unparseable verdict' };
+    if (verdict.verdict === 'supported') {
+      const result = soul.recordConclusion(draft, { allowed: batch.map((fact) => fact.id) });
+      log(
+        `consolidate ok: "${draft.statement}" evidence=${draft.evidence.length} ` +
+          `written=${result.ok}${result.superseded ? ' superseded=1' : ''}`,
+      );
+      trace({ event: 'consolidate', verdict: 'supported', ok: result.ok, reason: result.reason, statement: draft.statement });
+    } else {
+      // Partial support is dropped, not downgraded: a half-true conclusion is a
+      // wrong one, and the sample is what teaches the prompt next time.
+      log(`consolidate dropped: ${verdict.verdict} — "${draft.statement}" (${verdict.reason ?? '-'})`);
+      trace({ event: 'consolidate', verdict: verdict.verdict, dropped: true, reason: verdict.reason, statement: draft.statement });
+    }
+    writeConsolidationState({ lastCount: soul.factTotal(), pending: null });
+    return true;
+  }
+
+  const total = soul.factTotal();
+  if (total - state.lastCount < CONSOLIDATION_BATCH) return false;
+
+  const batch = soul.recentFacts(CONSOLIDATION_MAX_FACTS).map((fact) => ({
+    id: fact.id,
+    statement: fact.statement,
+    atText: fact.atText,
+  }));
+  if (batch.length < 2) {
+    writeConsolidationState({ lastCount: total, pending: null });
+    return false;
+  }
+
+  const raw = await injectedLlm(
+    renderConsolidationPrompt({
+      facts: batch,
+      existing: soul.conclusions(5).map((fact) => ({ id: fact.id, statement: fact.statement })),
+    }),
+  );
+  const draft = parseConclusionDraft(raw);
+  if (!draft) {
+    log(`consolidate: nothing to conclude from ${batch.length} facts`);
+    trace({ event: 'consolidate', verdict: 'none', batch: batch.length });
+    writeConsolidationState({ lastCount: total, pending: null });
+    return true;
+  }
+  log(`consolidate draft: "${draft.statement}" evidence=${draft.evidence.join(',')} — verifying next step`);
+  trace({ event: 'consolidate', verdict: 'draft', statement: draft.statement, evidence: draft.evidence });
+  writeConsolidationState({ lastCount: state.lastCount, pending: { phase: 'verify', draft, batch } });
+  return true;
 }
 
 /**
