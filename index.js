@@ -505,34 +505,18 @@ export function createPreStepHandler(deps) {
 const pendingTurns = new Map();
 
 /**
- * Primary flush is the host's `turn/end` event. The silence timer below is only
- * a fallback for the case where it never arrives (host bug, plugin reload mid
- * turn): a reply is treated as finished once no new assistant/message arrives
- * for this long.
+ * The turn boundary is an event, not a silence.
+ *
+ * This used to write a turn after two seconds without a new assistant message.
+ * That looked harmless until the data said otherwise: a tool call often runs
+ * longer than two seconds, so the timer fired mid-turn, wrote a truncated pair
+ * and dropped everything after it. One recorded write landed 1m47s before the
+ * same turn's `turn/end`.
+ *
+ * Now the only triggers are `turn/end` and the next user message. If the app is
+ * killed mid-turn, that turn is lost — a missing turn is better than a turn cut
+ * in half, and the loss is visible (the next turn's text starts mid-story).
  */
-const PAIR_FLUSH_DELAY_MS = 2000;
-const flushTimers = new Map();
-
-function scheduleFlush(sessionId) {
-  const existing = flushTimers.get(sessionId);
-  if (existing) clearTimeout(existing);
-  flushTimers.set(
-    sessionId,
-    setTimeout(() => {
-      flushTimers.delete(sessionId);
-      flushTurnPair(sessionId);
-    }, PAIR_FLUSH_DELAY_MS),
-  );
-}
-
-function cancelFlush(sessionId) {
-  const existing = flushTimers.get(sessionId);
-  if (existing) {
-    clearTimeout(existing);
-    flushTimers.delete(sessionId);
-  }
-}
-
 function noteUserTurn(sessionId, event, text) {
   pendingTurns.set(sessionId, {
     turn: Number(event?.data?.turn ?? event?.seq ?? 0),
@@ -546,7 +530,6 @@ function noteAssistantPart(sessionId, text) {
   const pending = pendingTurns.get(sessionId);
   if (!pending) return;
   pending.assistantParts.push(text);
-  scheduleFlush(sessionId);
 }
 
 /** One step of the reply, kept in order: reasoning, text, tool. */
@@ -558,12 +541,11 @@ function noteAssistantStep(sessionId, kind, text) {
 }
 
 /**
- * Write the pending exchange. Called after reply silence, before the next user
- * turn, and on turn/start. No assistant text means the turn never completed —
+ * Write the pending exchange. Called on `turn/end` and, as a fallback, when the
+ * next user message arrives. No assistant text means the turn never completed —
  * drop it rather than write a pair with an empty side (RFC 0007 §2.2).
  */
 function flushTurnPair(sessionId) {
-  cancelFlush(sessionId);
   const pending = pendingTurns.get(sessionId);
   if (!pending) return;
   pendingTurns.delete(sessionId);

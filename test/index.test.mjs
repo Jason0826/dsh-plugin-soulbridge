@@ -263,3 +263,13 @@ test('correction: 不是纠正的消息不落证据', () => {
     { type: 'tool-call', name: 'functions.pwsh', argsChars: 16 },
   ]);
 });
+test('turn boundary is an event, not a silence', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  // A timeout used to write the turn mid-reply: a tool call longer than the
+  // silence window cut the turn in half. Only turn/end (and the next user
+  // message) may flush now.
+  assert.equal(source.includes('PAIR_FLUSH_DELAY_MS'), false, 'silence timer must stay gone');
+  assert.equal(source.includes('scheduleFlush'), false, 'nothing may schedule a timed flush');
+  assert.match(source, /if \(type === 'turn\/end'\)/);
+});

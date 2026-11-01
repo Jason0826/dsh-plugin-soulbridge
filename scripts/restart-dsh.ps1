@@ -23,6 +23,15 @@ param(
   # Point the plugin at a different home (config, database, logs). Used to run
   # experiments against a throwaway database instead of the real one.
   [string]$SoulbridgeHome = '',
+  # Delete the Electron cookie store before starting.
+  #
+  # The desktop app picks a random webhost port on every start and names its auth
+  # cookie after host:port, with a 30-day life and no pruning. Each start adds one
+  # cookie (~228 bytes), and once the accumulated request header passes Node's
+  # 16KB limit the app fails its startup handshake with "Web authentication
+  # failed" — the 431 the crash log does not spell out. Clearing the store here
+  # keeps it bounded, because this script is how the app is restarted.
+  [switch]$CleanCookies,
   [switch]$SkipFallback
 )
 
@@ -105,6 +114,29 @@ Write-Log "stopping app (pids: $pids)"
 Get-AppProcesses | Stop-Process -Force
 Start-Sleep -Seconds 4
 Write-Log "processes remaining after stop: $((Get-AppProcesses).Count)"
+
+# Inspect (and optionally clear) the Electron cookie store while it is unlocked.
+# The file is locked by the running app, so this is the only window to read it.
+$cookieDir = Join-Path $env:APPDATA '@deepseek-ai\dsh-desktop\Network'
+$cookieFile = Join-Path $cookieDir 'Cookies'
+if (Test-Path $cookieFile) {
+  $cookieBytes = (Get-Item $cookieFile).Length
+  Write-Log "cookies: $cookieBytes bytes before start"
+  if ($CleanCookies) {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = Join-Path $logDir "cookies-backup-$stamp.db"
+    try {
+      Copy-Item $cookieFile $backup -Force
+      Remove-Item $cookieFile -Force
+      Remove-Item (Join-Path $cookieDir 'Cookies-journal') -Force -ErrorAction SilentlyContinue
+      Write-Log "cookies: cleared (backup $backup)"
+    } catch {
+      Write-Log "cookies: clear failed: $($_.Exception.Message)"
+    }
+  }
+} else {
+  Write-Log 'cookies: store not found'
+}
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   if (Start-AndWatch "attempt $attempt") {
