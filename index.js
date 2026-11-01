@@ -632,6 +632,8 @@ async function runExtraction(text, turnId, turnNo) {
       skipped: result.skipped,
       ms,
     });
+    // Rules mode is a deliberate configuration, not a failed model call.
+    if (!useLlm) return 'rules-mode';
     return draft.by === 'llm' ? 'ok' : `rules:${draft.reason ?? 'unknown'}`;
   } catch (error) {
     log(`extract failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -648,7 +650,19 @@ let draining = false;
  * turns are written at the end of one and extracted at the start of the next.
  * A failure keeps the item for a retry; three failures drop it with the reason.
  */
-async function drainExtractionQueue() {
+/**
+ * Drain ONE queued turn per step.
+ *
+ * The host model is only callable inside the current step: of three serial
+ * calls in one drain, the middle one succeeded and the other two failed with the
+ * stream gone. One item per step keeps every attempt inside that window; the
+ * queue is a backlog, not a batch.
+ *
+ * A model failure keeps the item, because the rules pass is only a floor: if it
+ * counted as done, that turn would never get a model extraction. Three failures
+ * drop it with the reason.
+ */
+export async function drainExtractionQueue() {
   if (draining) return;
   const config = readConfig();
   if (config.extract === 'off') return;
@@ -656,32 +670,39 @@ async function drainExtractionQueue() {
   if (queue.length === 0) return;
   draining = true;
   try {
-    const remaining = [];
-    for (const item of queue.slice(0, 5)) {
-      let text = '';
-      try {
-        const turn = ensureSoul().turn(item.turnId);
-        text = turn?.userText ?? '';
-      } catch {
-        text = '';
-      }
-      if (!text) {
-        log(`extract queue: turn ${item.turnId} missing, dropped`);
-        continue;
-      }
-      const outcome = await runExtraction(text, item.turnId, item.turnNo);
-      if (outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome.startsWith('rules:')) {
-        continue;
-      }
-      const attempts = (item.attempts ?? 0) + 1;
-      if (attempts >= EXTRACT_MAX_ATTEMPTS) {
-        log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
-        continue;
-      }
-      remaining.push({ ...item, attempts });
+    const [item, ...rest] = queue;
+    let text = '';
+    try {
+      const turn = ensureSoul().turn(item.turnId);
+      text = turn?.userText ?? '';
+    } catch {
+      text = '';
     }
-    writeExtractQueue([...remaining, ...queue.slice(5)]);
-    trace({ event: 'extract-queue', drained: queue.slice(0, 5).length, remaining: remaining.length });
+    if (!text) {
+      log(`extract queue: turn ${item.turnId} missing, dropped`);
+      writeExtractQueue(rest);
+      return;
+    }
+
+    const outcome = await runExtraction(text, item.turnId, item.turnNo);
+    const ok =
+      outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
+    if (ok) {
+      writeExtractQueue(rest);
+      trace({ event: 'extract-queue', drained: 1, remaining: rest.length, outcome });
+      return;
+    }
+
+    // A rules result caused by a broken model call is not a completed extraction.
+    const attempts = (item.attempts ?? 0) + 1;
+    if (attempts >= EXTRACT_MAX_ATTEMPTS) {
+      log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
+      writeExtractQueue(rest);
+      return;
+    }
+    log(`extract queue: retry turn=${item.turnNo} attempt=${attempts} (${outcome})`);
+    writeExtractQueue([{ ...item, attempts }, ...rest]);
+    trace({ event: 'extract-queue', drained: 1, remaining: rest.length + 1, outcome, retry: true });
   } finally {
     draining = false;
   }
