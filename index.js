@@ -471,7 +471,7 @@ async function runExtraction(text, turnId, turnNo) {
     const result = ensureSoul().commitDrafts(draft, { turnId });
     const ms = Date.now() - started;
     log(
-      `extract ok: by=${draft.by} entities=${result.entities.length} facts=${result.facts.length}` +
+      `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
         ` gaps=${result.gaps.length} skipped=${result.skipped.length} ms=${ms} turn=${turnNo}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
