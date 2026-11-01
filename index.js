@@ -91,6 +91,9 @@ function readConfig() {
 }
 
 /** Adapter side of the core LlmFn port: the host model, called inside a turn. */
+let currentTurn;
+let currentStep;
+
 function makeLlm(ctx, config) {
   if (config.distill !== 'llm') return undefined;
   // Resolve the service on first use: at apply() time the llm plugin may not be
@@ -98,20 +101,38 @@ function makeLlm(ctx, config) {
   return async (prompt) => {
     const service = ctx.get('llm');
     if (!service) throw new Error('llm service unavailable');
-    return collectText(
-      service.stream({
-        provider: config.provider,
-        model: config.model,
-        messages: [
-          {
-            id: `distill_${Date.now()}`,
-            role: 'user',
-            content: [{ type: 'text', text: prompt }],
-            source: { kind: 'user' },
-          },
-        ],
-      }),
-    );
+    // Probe: the same call succeeds and fails minutes apart, and we only ever
+    // recorded the outcome. Start/end plus the live turn/step show which window
+    // a call actually lands in.
+    const started = Date.now();
+    log(`llm probe: start turn=${currentTurn ?? '?'} step=${currentStep ?? '?'} chars=${prompt.length}`);
+    try {
+      const text = await collectText(
+        service.stream({
+          provider: config.provider,
+          model: config.model,
+          messages: [
+            {
+              id: `distill_${Date.now()}`,
+              role: 'user',
+              content: [{ type: 'text', text: prompt }],
+              source: { kind: 'user' },
+            },
+          ],
+        }),
+      );
+      log(
+        `llm probe: end ok ms=${Date.now() - started} out=${typeof text === 'string' ? text.length : -1}` +
+          ` step=${currentStep ?? '?'}`,
+      );
+      return text;
+    } catch (error) {
+      log(
+        `llm probe: end fail ms=${Date.now() - started} step=${currentStep ?? '?'}` +
+          ` err=${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
   };
 }
 
@@ -267,6 +288,14 @@ function safeKeys(value) {
 }
 
 /** UserMessage.content is a ContentBlock[]; only text blocks are user prose. */
+function reasoningOf(content) {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((block) => block && block.type === 'reasoning' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+    .trim();
+}
 function textOf(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -520,6 +549,14 @@ function noteAssistantPart(sessionId, text) {
   scheduleFlush(sessionId);
 }
 
+/** One step of the reply, kept in order: reasoning, text, tool. */
+function noteAssistantStep(sessionId, kind, text) {
+  const pending = pendingTurns.get(sessionId);
+  if (!pending) return;
+  if (!pending.steps) pending.steps = [];
+  pending.steps.push({ idx: pending.steps.length, kind, text, at: Date.now() });
+}
+
 /**
  * Write the pending exchange. Called after reply silence, before the next user
  * turn, and on turn/start. No assistant text means the turn never completed —
@@ -541,6 +578,7 @@ function flushTurnPair(sessionId) {
       userText: pending.userText,
       assistantText: pending.assistantParts.join('\n'),
       at: pending.at,
+      steps: pending.steps ?? [],
     });
     const chars = pending.userText.length + pending.assistantParts.join('').length;
     log(`turn pair recorded session=${sessionId} turn=${pending.turn} chars=${chars}`);
@@ -1026,12 +1064,21 @@ export function apply(ctx) {
       const sessionId = session?.id ?? 'default';
 
       // Keep the last reply: a correction only makes sense next to what it targets.
+      if (typeof event.data?.turn === 'number') currentTurn = event.data.turn;
+      if (typeof event.data?.step === 'number') currentStep = event.data.step;
+
       if (type === 'assistant/message') {
-        const reply = textOf(event.data?.message?.content);
+        const content = event.data?.message?.content;
+        const reply = textOf(content);
         if (reply.length > 0) {
           lastAssistantText = reply;
           noteAssistantPart(sessionId, reply);
         }
+        // Reasoning is stored, never injected: it is a draft, but "why did you
+        // say that" and consolidation both need it.
+        const reasoning = reasoningOf(content);
+        if (reasoning.length > 0) noteAssistantStep(sessionId, 'reasoning', reasoning);
+        if (reply.length > 0) noteAssistantStep(sessionId, 'text', reply);
         // Context size per request: the only number that can show whether a
         // long session is running away (no user text, usage only).
         trace({
