@@ -535,7 +535,7 @@ function flushTurnPair(sessionId) {
     return;
   }
   try {
-    ensureSoul().recordTurnPair({
+    const turnId = ensureSoul().recordTurnPair({
       sessionId,
       turn: pending.turn,
       userText: pending.userText,
@@ -547,7 +547,7 @@ function flushTurnPair(sessionId) {
     // Extraction is queued, not run here: outside a live turn the host model is
     // not callable (every attempt returned an empty stream today). The queue is
     // drained at the start of the next turn, which is inside one.
-    enqueueExtraction(`tn_${sessionId}_${pending.turn}`, pending.turn);
+    enqueueExtraction(turnId, pending.turn);
   } catch (error) {
     log(`turn pair failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -700,7 +700,7 @@ async function backfillExtraction() {
     const recent = ensureSoul().recallTurnPairs('', 5);
     log(`extract backfill: queued ${recent.length} turns`);
     for (const turn of recent) {
-      enqueueExtraction(`tn_${turn.sessionId}_${turn.turn}`, turn.turn);
+      enqueueExtraction(turn.id, turn.turn);
     }
     writeFileSync(marker, new Date().toISOString());
   } catch (error) {
