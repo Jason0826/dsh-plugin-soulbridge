@@ -64,7 +64,6 @@ function trace(record) {
 }
 
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
-const CACHE_MS = 30_000;
 
 /**
  * Optional plugin config: ~/.soulbridge/plugin-config.json
@@ -199,7 +198,18 @@ function ensureSoul() {
   }
 }
 
-let cache = { text: '', at: 0 };
+/** Last system-prompt text hash, so a changed section is visible in the trace. */
+let lastSectionHash = '';
+
+/** FNV-1a: short, dependency-free, good enough to detect change. */
+function hashText(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16);
+}
 
 /**
  * Anchors: the few rules that should always be visible. Kept in the system
@@ -218,23 +228,32 @@ const ANCHOR = { types: ['strategy', 'fact', 'trait'], minImportance: 8, maxItem
  * pairs — do not go back to cutting length.
  */
 
-/** Synchronous by necessity: PromptSection.text cannot return a promise. */
+/**
+ * The system-prompt section: identity and style only.
+ *
+ * DSH declares `systemPromptUpdate: "in-history"` for this provider, and the
+ * loop appends every *changed* prompt as a new system node that keeps counting
+ * until compaction. Anchor memories drift with recency, so putting them here
+ * would grow the prompt version by version over a long session. Anything that
+ * changes per turn goes through the pre-step message instead.
+ *
+ * Synchronous by necessity: PromptSection.text cannot return a promise.
+ */
 function buildInjection() {
-  const now = Date.now();
-  if (now - cache.at < CACHE_MS) return cache.text;
   try {
-    const result = ensureSoul().context({ track: false, ...ANCHOR });
-    cache = { text: result.text, at: now };
-    const state = readState();
-    writeState({
-      injects: (state.injects ?? 0) + 1,
-      lastInjectAt: now,
-      lastInjectedChars: result.text.length,
-      lastInjectedMemories: result.used.length,
-    });
-    return cache.text;
-  } catch {
-    return cache.text;
+    const result = ensureSoul().context({ track: false, includeAnchors: false });
+    const text = result.text;
+    const hash = hashText(text);
+    if (hash !== lastSectionHash) {
+      const changed = lastSectionHash !== '';
+      lastSectionHash = hash;
+      log(`section: ${changed ? 'changed' : 'first'} hash=${hash} chars=${text.length}`);
+      trace({ event: 'section', hash, changed, chars: text.length });
+    }
+    return text;
+  } catch (error) {
+    log(`section: failed: ${error instanceof Error ? error.message : String(error)}`);
+    return '';
   }
 }
 
@@ -290,10 +309,32 @@ export function summarizeBlocks(content) {
  * Every related pair is injected, whatever its length.
  */
 function buildRelatedContext(text) {
+  const parts = [];
+  const used = [];
+  try {
+    // Anchors moved here from the system prompt: a message is counted once and
+    // compacted normally, while a changed prompt becomes a new prompt version.
+    const anchors = ensureSoul().context({
+      track: false,
+      includeSoul: false,
+      includeStyle: false,
+      ...ANCHOR,
+    });
+    if (anchors.text.trim()) {
+      parts.push(anchors.text.trim());
+      used.push(...anchors.used);
+    }
+  } catch (error) {
+    log(`prestep: anchors failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const pairs = ensureSoul().recallTurnPairs(text);
-  if (pairs.length === 0) return '';
-  const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
-  return { text: `<memories>\n${body}\n</memories>`, used: pairs.map((pair) => pair.id) };
+  if (pairs.length > 0) {
+    const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
+    parts.push(`<related>\n${body}\n</related>`);
+    used.push(...pairs.map((pair) => pair.id));
+  }
+  if (parts.length === 0) return '';
+  return { text: parts.join('\n\n'), used };
 }
 
 /**
@@ -536,7 +577,7 @@ async function observeText(text) {
       `observe ok: chars=${text.length} written=${result?.written ?? '?'} committed=${result?.committed ?? '?'} by=${result?.extractedBy ?? '?'} llm=${result?.llmOutcome ?? '?'}` +
         ` affect=${affect.dominant ?? 'none'} confidence=${affect.confidence ?? '?'} ms=${Date.now() - started}`,
     );
-    cache.at = 0; // a new observation may change what should be injected
+    // A new observation may change the anchors inside the next pre-step block.
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const state = readState();
@@ -683,7 +724,7 @@ export function apply(ctx) {
           try {
             soul?.store?.close();
             soul = null;
-            cache = { text: '', at: 0 };
+            lastSectionHash = '';
             log('effect disposed (store closed)');
           } catch (error) {
             log(`dispose failed: ${error instanceof Error ? error.message : String(error)}`);
