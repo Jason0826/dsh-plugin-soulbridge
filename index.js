@@ -451,9 +451,45 @@ function buildRelatedContext(text) {
  *
  * @param deps.getContext - returns the memory block for one message, or ''.
  */
+/**
+ * The "where were we" block for a new session, or '' when there is nothing to
+ * hand over. Pure: the caller decides when, this decides what.
+ */
+export function renderHandoff(last, sessionId) {
+  if (!last || last.thread.sessionId === sessionId) return '';
+  const when = new Date(last.thread.closedAt ?? Date.now()).toISOString().slice(0, 10);
+  const lines = [`<handoff topic="${last.thread.topic.slice(0, 30)}" closed="${when}">`];
+  if (last.conclusion) lines.push(`  上次的结论：${last.conclusion.statement}`);
+  for (const turn of last.turns) {
+    lines.push(`  ${turn.turnNo}. 用户：${turn.userText.replace(/\s+/g, ' ').slice(0, 80)}`);
+  }
+  lines.push('</handoff>');
+  return lines.join('\n');
+}
+
 export function createPreStepHandler(deps) {
   /** sessionId -> last turn that received an injection */
   const injectedTurn = new Map();
+  /** Sessions that already got the handoff block once. */
+  const handedOff = new Set();
+
+  /**
+   * The "where were we" block: the last topic that finished.
+   *
+   * Deliberately once per session and only when that topic belongs to a
+   * different session — repeating it every turn would make it wallpaper, and
+   * re-reading the previous session's own topic is not a handoff.
+   */
+  function takeHandoff(sessionId) {
+    if (handedOff.has(sessionId)) return '';
+    handedOff.add(sessionId);
+    try {
+      return renderHandoff(ensureSoul().lastClosedThread(), sessionId);
+    } catch (error) {
+      log(`handoff failed: ${error instanceof Error ? error.message : String(error)}`);
+      return '';
+    }
+  }
 
   return async (payload, next) => {
     const decision = await next();
@@ -497,8 +533,13 @@ export function createPreStepHandler(deps) {
       if (injectedTurn.get(sessionId) === turn) return decision;
 
       const ctx = deps.getContext(text);
-      const block = typeof ctx === 'string' ? ctx : (ctx?.text ?? '');
+      const related = typeof ctx === 'string' ? ctx : (ctx?.text ?? '');
       const used = typeof ctx === 'string' ? [] : (ctx?.used ?? []);
+      // "Where were we" is answered by the last topic that finished, not by the
+      // previous session: one session can hold several topics, and a topic can
+      // span sessions. Injected once per session, when it is a different one.
+      const handoff = takeHandoff(sessionId);
+      const block = [handoff, related].filter(Boolean).join('\n\n');
       injectedTurn.set(sessionId, turn);
       if (injectedTurn.size > 16) {
         // Keep the map bounded: drop the oldest entry, not the newest.
@@ -517,8 +558,8 @@ export function createPreStepHandler(deps) {
         source: { kind: 'memory-context' },
       };
       const idPart = used.length > 0 ? ` ids=[${used.join(',')}]` : '';
-      log(`prestep: inject turn=${turn} chars=${block.length}${idPart}`);
-      trace({ event: 'inject', session: sessionId, turn, chars: block.length, ids: used });
+      log(`prestep: inject turn=${turn} chars=${block.length}${idPart} handoff=${handoff ? 'yes' : 'no'}`);
+      trace({ event: 'inject', session: sessionId, turn, chars: block.length, ids: used, handoff: Boolean(handoff) });
       return { ...decision, messages: [...decision.messages, note] };
     } catch (error) {
       log(`prestep: skipped after error: ${error instanceof Error ? error.message : String(error)}`);
