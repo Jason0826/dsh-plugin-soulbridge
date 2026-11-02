@@ -25,6 +25,7 @@ import {
   renderRelationPrompt,
   renderRuleClassifyPrompt,
   parseRuleClassifications,
+  selectRules,
   renderVerificationPrompt,
   parseRelationDraft,
   normalizeStatement,
@@ -435,7 +436,23 @@ export function planBlocks(plan) {
   return { related: true, timeline: false };
 }
 
-function buildRelatedContext(text) {
+const RULE_LIMIT = 5;
+
+/** Session counters a rule can key on; unknown flags are simply false. */
+export function buildRuleState(state = {}) {
+  const turn = Number(state.turn ?? 0);
+  return { 'long-session': Number.isFinite(turn) && turn > 100 };
+}
+
+/** Render the fired rules as a requirement block, closest to the reply. */
+export function renderRulesBlock(rules) {
+  if (!Array.isArray(rules) || rules.length === 0) return '';
+  const ids = rules.map((rule) => rule.id).join(',');
+  const lines = rules.map((rule) => `- ${rule.statement}`).join('\n');
+  return `<rules fired="${ids}">\n${lines}\n</rules>`;
+}
+
+function buildRelatedContext(text, state = {}) {
   const parts = [];
   const used = [];
   // The plan is computed first because it decides which blocks are allowed.
@@ -496,6 +513,18 @@ function buildRelatedContext(text) {
       parts.push(`<related>\n${body}\n</related>`);
       used.push(...pairs.map((pair) => pair.id));
     }
+  }
+  // Rules last, and only the ones whose situation applies: the block sits closest
+  // to the reply and reads as a requirement, not as background material.
+  try {
+    const fired = selectRules(ensureSoul().rules(), text, buildRuleState(state), RULE_LIMIT);
+    if (fired.length > 0) {
+      parts.push(renderRulesBlock(fired));
+      log(`rules fired: ${fired.map((rule) => rule.id).join(',')}`);
+      trace({ event: 'rule_fired', rules: fired.map((rule) => rule.id), turn: state.turn ?? null });
+    }
+  } catch (error) {
+    log(`rules failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (parts.length === 0) return '';
   // Retrieval practice: a fact that keeps being surfaced decays more slowly.
@@ -667,7 +696,7 @@ export function createPreStepHandler(deps) {
       // would compare undefined === undefined and skip every pre-step silently.
       if (turn !== undefined && injectedTurn.get(sessionId) === turn) return decision;
 
-      const ctx = deps.getContext(text);
+      const ctx = deps.getContext(text, { turn });
       const related = typeof ctx === 'string' ? ctx : (ctx?.text ?? '');
       const used = typeof ctx === 'string' ? [] : (ctx?.used ?? []);
       // "Where were we" is answered by the last topic that finished, not by the
