@@ -194,19 +194,48 @@ function makeLlm(ctx, config) {
  * The host emits `text-delta` chunks and then a `block-end` carrying the whole
  * block. Concatenating both doubled every reply, which turned valid JSON into
  * two concatenated objects and made every distillation look like `failed`.
+ *
+ * A failed call is not an empty answer: the host ends the stream with
+ * `finish{reason:{kind:'error'|'aborted'}}` instead of throwing, so without this
+ * check the failure came back as `''` and the caller read it as "the model said
+ * nothing". `collectText` throws unless some text was produced before the failure.
  */
 export async function collectText(stream) {
   let text = '';
   let sawDelta = false;
+  let failure;
   for await (const chunk of stream) {
     if (chunk.type === 'text-delta') {
       text += chunk.text;
       sawDelta = true;
     } else if (!sawDelta && chunk.type === 'block-end' && chunk.block?.type === 'text') {
       text += chunk.block.text ?? '';
+    } else if (chunk.type === 'finish' && (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted')) {
+      failure = chunk.reason;
     }
   }
+  if (failure && text.length === 0) {
+    const detail = failure.message ? `: ${failure.message}` : '';
+    throw new Error(`model call ended without output (${failure.kind}${detail})`);
+  }
   return text;
+}
+
+/**
+ * What the consolidation call actually returned.
+ *
+ * `parseConclusionDraft` returns null for both "nothing to conclude" and "could not
+ * read the reply". Treating them the same dropped the thread's conclusion whenever
+ * the call failed — the failure looked exactly like a decision.
+ */
+export function readConsolidationReply(raw) {
+  const text = String(raw ?? '').trim();
+  if (text === '') return { kind: 'empty' };
+  const draft = parseConclusionDraft(text);
+  if (draft) return { kind: 'draft', draft };
+  // An explicit "无" is an answer; anything else that does not parse is a failure.
+  if (/^(无|没有|none)/m.test(text)) return { kind: 'none' };
+  return { kind: 'unparseable' };
 }
 
 function log(line) {
@@ -1626,16 +1655,34 @@ async function runConsolidationStep() {
     try {
       raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
     } catch (error) {
-      // The draft is still pending; the next step retries the check.
-      log(`consolidate verify failed: ${error instanceof Error ? error.message : String(error)} — retrying`);
+      // The draft is still pending; the next step retries the check — but a provider
+      // that keeps failing must not hold the queue head forever.
+      const attempts = (state.pending.attempts ?? 0) + 1;
+      if (attempts >= 3) {
+        log(`consolidate verify gave up after ${attempts} failed calls — "${draft.statement}"`);
+        trace({ event: 'consolidate', verdict: 'verify-abandoned', attempts, thread: threadId, reason: 'call-failed' });
+        writeConsolidationState({ pending: null });
+        return true;
+      }
+      writeConsolidationState({ pending: { ...state.pending, attempts } });
+      log(`consolidate verify failed (${error instanceof Error ? error.message : String(error)}) — retry ${attempts}/3`);
       return true;
     }
     const checked = readVerification(raw);
     if (checked.kind === 'retry') {
-      // An empty or unreadable reply is not evidence against the conclusion. Before
-      // this, it was coerced to "unsupported" and the draft was dropped unchecked.
-      log(`consolidate verify retry: ${checked.reason} — "${draft.statement}"`);
-      trace({ event: 'consolidate', verdict: 'verify-retry', reason: checked.reason, thread: threadId });
+      // An empty or unreadable reply is not evidence against the conclusion. But an
+      // unbounded retry parks the thread at the head of the queue forever, so the
+      // third unreadable reply drops the draft with a trace instead.
+      const attempts = (state.pending.attempts ?? 0) + 1;
+      if (attempts >= 3) {
+        log(`consolidate verify abandoned after ${attempts} unreadable replies — "${draft.statement}"`);
+        trace({ event: 'consolidate', verdict: 'verify-abandoned', attempts, thread: threadId });
+        writeConsolidationState({ pending: null });
+        return true;
+      }
+      writeConsolidationState({ pending: { ...state.pending, attempts } });
+      log(`consolidate verify retry ${attempts}/3: ${checked.reason} — "${draft.statement}"`);
+      trace({ event: 'consolidate', verdict: 'verify-retry', reason: checked.reason, thread: threadId, attempts });
       return true;
     }
     const verdict = checked.verdict;
@@ -1736,16 +1783,25 @@ async function runConsolidationStep() {
     deferConsolidationThread(threadId, 'draft-call-failed');
     return true;
   }
-  const draft = parseConclusionDraft(raw);
-  if (!draft) {
-    log(`consolidate: nothing to conclude from thread ${threadId} (${batch.length} facts)`);
-    trace({ event: 'consolidate', verdict: 'none', thread: threadId, batch: batch.length });
-    writeConsolidationState({ pending: null });
+  const reply = readConsolidationReply(raw);
+  if (reply.kind !== 'draft') {
+    if (reply.kind === 'none') {
+      log(`consolidate: nothing to conclude from thread ${threadId} (${batch.length} facts)`);
+      trace({ event: 'consolidate', verdict: 'none', thread: threadId, batch: batch.length });
+      writeConsolidationState({ pending: null });
+      return true;
+    }
+    // Empty or unreadable is a failed call, not a decision. Put the thread back with
+    // an attempt counter instead of discarding its conclusion.
+    log(`consolidate: unreadable draft (${reply.kind}) — deferring thread ${threadId}`);
+    trace({ event: 'consolidate', verdict: 'draft-unreadable', thread: threadId, reason: reply.kind });
+    deferConsolidationThread(threadId, `draft-${reply.kind}`);
     return true;
   }
+  const draft = reply.draft;
   log(`consolidate draft: thread=${threadId} "${draft.statement}" evidence=${draft.evidence.join(',')} — verifying next step`);
   trace({ event: 'consolidate', verdict: 'draft', statement: draft.statement, evidence: draft.evidence, thread: threadId });
-  writeConsolidationState({ pending: { phase: 'verify', draft, batch, threadId } });
+  writeConsolidationState({ pending: { phase: 'verify', draft, batch, threadId, attempts: 0 } });
   return true;
 }
 
