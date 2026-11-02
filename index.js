@@ -1183,15 +1183,17 @@ async function runConsolidationStep() {
   if (!threadId) return false;
   const context = soul.threadContext(threadId);
   if (!context) {
+    // A skip is not a model call: returning true here starved the classifier, which
+    // only runs when nothing else needed the one call per step.
     log(`consolidate: thread ${threadId} missing, skipped`);
-    return true;
+    return false;
   }
   // Two citations are the floor for a conclusion; a thread with fewer facts is
   // recorded as "not yet", not forced into a judgement.
   if (context.facts.length < 2) {
     log(`consolidate skipped: thread ${threadId} has ${context.facts.length} fact(s)`);
     trace({ event: 'consolidate', verdict: 'too-few-facts', thread: threadId, facts: context.facts.length });
-    return true;
+    return false;
   }
 
   const batch = context.facts.slice(0, CONSOLIDATION_MAX_FACTS).map((fact) => ({
