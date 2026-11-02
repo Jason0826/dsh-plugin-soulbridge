@@ -22,6 +22,8 @@ import {
   detectCorrection,
   renderConsolidationPrompt,
   renderRelationPrompt,
+  renderRuleClassifyPrompt,
+  parseRuleClassifications,
   renderVerificationPrompt,
   parseRelationDraft,
   normalizeStatement,
@@ -590,7 +592,12 @@ export function createPreStepHandler(deps) {
       void (async () => {
         try {
           const extracted = await drainExtractionQueue();
-          if (!extracted) await runConsolidationStep();
+          if (!extracted) {
+            const consolidated = await runConsolidationStep();
+            // Old lessons still need their rule/profile split before rules can fire;
+            // it runs last so live conversation always wins the one call per step.
+            if (!consolidated) await runClassifyStep();
+          }
         } catch (error) {
           log(`background: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -1027,6 +1034,69 @@ function finishConclusion(soul, draft, { threadId, batch, relation }) {
   writeConsolidationState({ pending: null });
 }
 
+/* ------------------------------------------------------------------ *
+ * Classifying old lessons: rule (with trigger) or profile (ADR 0033)
+ * ------------------------------------------------------------------ */
+
+const CLASSIFY_FILE = join(HOME, 'pending-classify.json');
+const CLASSIFY_BATCH = 10;
+
+function readClassifyQueue() {
+  try {
+    const raw = JSON.parse(readFileSync(CLASSIFY_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeClassifyQueue(queue) {
+  try {
+    writeFileSync(CLASSIFY_FILE, JSON.stringify(queue.slice(0, 400), null, 2), 'utf8');
+  } catch (error) {
+    log(`classify queue write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function shiftClassifyBatch() {
+  const queue = readClassifyQueue();
+  if (queue.length === 0) return [];
+  const batch = queue.slice(0, CLASSIFY_BATCH);
+  writeClassifyQueue(queue.slice(batch.length));
+  return batch;
+}
+
+/**
+ * One classification batch per quiet step.
+ *
+ * Returns true when a model call was made, mirroring the extraction contract so the
+ * caller can keep to one call per step.
+ */
+async function runClassifyStep() {
+  const config = readConfig();
+  if (config.extract === 'off' || !injectedLlm) return false;
+  const batch = shiftClassifyBatch();
+  if (batch.length === 0) return false;
+  const raw = await injectedLlm(renderRuleClassifyPrompt({ items: batch }));
+  const classified = parseRuleClassifications(raw);
+  const soul = ensureSoul();
+  let rules = 0;
+  let profiles = 0;
+  const known = new Set(batch.map((item) => item.id));
+  for (const item of classified) {
+    if (!known.has(item.id)) continue;
+    if (item.kind === 'rule' && item.trigger) {
+      soul.markRule(item.id, { trigger: item.trigger, action: item.action });
+      rules += 1;
+    } else {
+      soul.markProfile(item.id);
+      profiles += 1;
+    }
+  }
+  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles}`);
+  trace({ event: 'classify', batch: batch.length, rules, profiles });
+  return true;
+}
 /**
  * One consolidation step per call, never two model calls in one step.
  *
