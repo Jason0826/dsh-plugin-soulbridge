@@ -445,7 +445,31 @@ function buildRelatedContext(text) {
     parts.push(`<related>\n${body}\n</related>`);
     used.push(...pairs.map((pair) => pair.id));
   }
+  // Which primitive this question wanted, and whether the answer came from the
+  // right subject. Logged because a wrong subject is the one error worse than
+  // saying nothing, and it is invisible without the plan.
+  try {
+    const plan = ensureSoul().planRetrieval(text);
+    log(`router: ${plan.primitive}${plan.subject ? `(${plan.subject})` : ''} — ${plan.reason}`);
+    trace({ event: 'router', primitive: plan.primitive, subject: plan.subject ?? null, reason: plan.reason });
+    if (plan.primitive === 'entity' && plan.subject) {
+      const timeline = ensureSoul().latestAbout(plan.subject, { limit: 3 });
+      if (timeline.length > 0) {
+        const body = timeline.map((fact) => `- [${fact.id}] ${fact.atText ? `${fact.atText} ` : ''}${fact.statement}`).join('\n');
+        parts.push(`<about-now name="${plan.subject}">\n${body}\n</about-now>`);
+        used.push(...timeline.map((fact) => fact.id));
+      }
+    }
+  } catch (error) {
+    log(`router failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   if (parts.length === 0) return '';
+  // Retrieval practice: a fact that keeps being surfaced decays more slowly.
+  try {
+    ensureSoul().recordRecalls(used.filter((id) => String(id).startsWith('fc_')));
+  } catch (error) {
+    log(`recordRecalls failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return { text: parts.join('\n\n'), used };
 }
 
