@@ -915,17 +915,23 @@ function flushTurnPair(sessionId) {
 const EXTRACT_QUEUE_FILE = join(HOME, 'pending-extract.json');
 const EXTRACT_MAX_ATTEMPTS = 3;
 
-function readExtractQueue() {
+/**
+ * Read a queue file.
+ *
+ * The four stages keep different items and different caps, but the file handling is
+ * the same shape, and it used to be written out four times. An unreadable file is
+ * not an empty one: treating it as empty silently erases the backlog on the next
+ * write, so it is moved aside and logged.
+ */
+function readQueueFile(file) {
   try {
-    const raw = JSON.parse(readFileSync(EXTRACT_QUEUE_FILE, 'utf8'));
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
     return Array.isArray(raw) ? raw : [];
   } catch (error) {
-    // An unreadable queue must not look like an empty one: that silently erases the
-    // backlog on the next write.
-    if (existsSync(EXTRACT_QUEUE_FILE)) {
-      log(`extract queue unreadable, setting it aside: ${error instanceof Error ? error.message : String(error)}`);
+    if (existsSync(file)) {
+      log(`queue unreadable (${file}), setting it aside: ${error instanceof Error ? error.message : String(error)}`);
       try {
-        renameSync(EXTRACT_QUEUE_FILE, `${EXTRACT_QUEUE_FILE}.corrupt-${Date.now()}`);
+        renameSync(file, `${file}.corrupt-${Date.now()}`);
       } catch {
         /* the log above is the record */
       }
@@ -934,17 +940,25 @@ function readExtractQueue() {
   }
 }
 
-function writeExtractQueue(queue) {
+/**
+ * Write a queue file, keeping either the newest or the oldest items over the cap.
+ *
+ * Extraction keeps the newest (the old code kept the oldest and dropped the turns
+ * that had just been added); the rest keep the oldest, because they are FIFO work
+ * lists where the front is the most urgent.
+ */
+function writeQueueFile(file, queue, { cap, keep = 'oldest' } = {}) {
   try {
-    // Keep the newest when over the cap — the old code kept the oldest and dropped
-    // exactly the turns that had just been added.
-    const kept = queue.length > 50 ? queue.slice(queue.length - 50) : queue;
-    if (kept.length < queue.length) log(`extract queue: dropped ${queue.length - kept.length} oldest items`);
-    writeFileSync(EXTRACT_QUEUE_FILE, JSON.stringify(kept, null, 2), 'utf8');
+    const kept = !cap || queue.length <= cap ? queue : keep === 'newest' ? queue.slice(queue.length - cap) : queue.slice(0, cap);
+    if (kept.length < queue.length) log(`queue over cap (${file}): dropped ${queue.length - kept.length}`);
+    writeFileSync(file, JSON.stringify(kept, null, 2), 'utf8');
   } catch (error) {
-    log(`extract queue write failed: ${error instanceof Error ? error.message : String(error)}`);
+    log(`queue write failed (${file}): ${error instanceof Error ? error.message : String(error)}`);
   }
 }
+
+const readExtractQueue = () => readQueueFile(EXTRACT_QUEUE_FILE);
+const writeExtractQueue = (queue) => writeQueueFile(EXTRACT_QUEUE_FILE, queue, { cap: 50, keep: 'newest' });
 
 /**
  * Remove one item by identity, computed from a fresh read.
@@ -1149,22 +1163,8 @@ function readConsolidationState() {
   }
 }
 
-function readConsolidationQueue() {
-  try {
-    const raw = JSON.parse(readFileSync(CONSOLIDATION_QUEUE_FILE, 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeConsolidationQueue(queue) {
-  try {
-    writeFileSync(CONSOLIDATION_QUEUE_FILE, JSON.stringify(queue.slice(0, 50), null, 2), 'utf8');
-  } catch (error) {
-    log(`consolidate queue write failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
+const readConsolidationQueue = () => readQueueFile(CONSOLIDATION_QUEUE_FILE);
+const writeConsolidationQueue = (queue) => writeQueueFile(CONSOLIDATION_QUEUE_FILE, queue, { cap: 50 });
 
 function enqueueConsolidation(threadIds) {
   if (!Array.isArray(threadIds) || threadIds.length === 0) return;
@@ -1310,22 +1310,8 @@ function finishConclusion(soul, draft, { threadId, batch, relation }) {
 
 const PROFILE_FILE = join(HOME, 'pending-profile.json');
 
-function readProfileQueue() {
-  try {
-    const raw = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeProfileQueue(queue) {
-  try {
-    writeFileSync(PROFILE_FILE, JSON.stringify(queue.slice(0, 200), null, 2), 'utf8');
-  } catch (error) {
-    log(`profile queue write failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
+const readProfileQueue = () => readQueueFile(PROFILE_FILE);
+const writeProfileQueue = (queue) => writeQueueFile(PROFILE_FILE, queue, { cap: 200 });
 
 export function peekProfileQueue() {
   return readProfileQueue();
@@ -1465,22 +1451,8 @@ export function hasMergeableGroup(queue) {
 const CLASSIFY_FILE = join(HOME, 'pending-classify.json');
 const CLASSIFY_BATCH = 10;
 
-function readClassifyQueue() {
-  try {
-    const raw = JSON.parse(readFileSync(CLASSIFY_FILE, 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeClassifyQueue(queue) {
-  try {
-    writeFileSync(CLASSIFY_FILE, JSON.stringify(queue.slice(0, 400), null, 2), 'utf8');
-  } catch (error) {
-    log(`classify queue write failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
+const readClassifyQueue = () => readQueueFile(CLASSIFY_FILE);
+const writeClassifyQueue = (queue) => writeQueueFile(CLASSIFY_FILE, queue, { cap: 400 });
 
 export function peekClassifyBatch() {
   return readClassifyQueue().slice(0, CLASSIFY_BATCH);
