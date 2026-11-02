@@ -118,6 +118,24 @@ function readConfig() {
 let currentTurn;
 let currentStep;
 
+const LLM_TIMEOUT_MS = 60_000;
+/** A hung model call must fail, not hold the whole stage chain forever. */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 function makeLlm(ctx, config) {
   if (config.distill !== 'llm') return undefined;
   // Resolve the service on first use: at apply() time the llm plugin may not be
@@ -131,19 +149,23 @@ function makeLlm(ctx, config) {
     const started = Date.now();
     log(`llm probe: start turn=${currentTurn ?? '?'} step=${currentStep ?? '?'} chars=${prompt.length}`);
     try {
-      const text = await collectText(
-        service.stream({
-          provider: config.provider,
-          model: config.model,
-          messages: [
-            {
-              id: `distill_${Date.now()}`,
-              role: 'user',
-              content: [{ type: 'text', text: prompt }],
-              source: { kind: 'user' },
-            },
-          ],
-        }),
+      const text = await withTimeout(
+        collectText(
+          service.stream({
+            provider: config.provider,
+            model: config.model,
+            messages: [
+              {
+                id: `distill_${Date.now()}`,
+                role: 'user',
+                content: [{ type: 'text', text: prompt }],
+                source: { kind: 'user' },
+              },
+            ],
+          }),
+        ),
+        LLM_TIMEOUT_MS,
+        'llm call',
       );
       log(
         `llm probe: end ok ms=${Date.now() - started} out=${typeof text === 'string' ? text.length : -1}` +
@@ -661,7 +683,21 @@ export function createPreStepHandler(deps) {
         stageChainBusy = true;
         void (async () => {
           try {
-            await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep, runProfileStep]);
+            // Fairness: a long consolidation backlog used to consume every step, so
+            // the profile merge never got a turn. The profile alternates with the
+            // rest of the chain instead of always queueing behind it.
+            const profilePending = peekProfileQueue().length >= 2;
+            const stages = [drainExtractionQueue];
+            if (profilePending && stageTick % 2 === 0) stages.push(runProfileStep);
+            stages.push(runConsolidationStep, runClassifyStep);
+            if (profilePending && stageTick % 2 === 1) stages.push(runProfileStep);
+            stageTick += 1;
+            await Promise.race([
+              runStageChain(stages),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('stage chain timed out')), 120_000),
+              ),
+            ]);
           } catch (error) {
             log(`background: ${error instanceof Error ? error.message : String(error)}`);
           } finally {
@@ -971,6 +1007,8 @@ async function runExtraction(text, turnId, turnNo) {
 let draining = false;
 /** True while a stage chain is running, so two chains never overlap. */
 let stageChainBusy = false;
+/** Alternates the profile merge with the rest of the chain so it cannot be starved. */
+let stageTick = 0;
 
 /**
  * Drain the extraction queue inside a live turn.
