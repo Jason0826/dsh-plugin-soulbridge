@@ -465,6 +465,42 @@ export function planBlocks(plan) {
   return { related: true, timeline: false };
 }
 
+const PROFILE_CORE_DIMENSION = '价值观';
+/** A facet is injected only when the message is about that dimension. */
+const FACET_TRIGGERS = {
+  工作方式: /代码|项目|实现|方案|架构|接口|测试|bug|重构/i,
+  沟通偏好: /聊天|回答|回复|表达|说话|解释/,
+  情绪: /累|烦|难受|焦虑|压力|开心|情绪|睡|难受/,
+  人际关系: /她|他|朋友|家里|关系|联系|见面|同事/,
+  生活兴趣: /吃|玩|旅行|电影|书|音乐|运动|兴趣|周末/,
+  边界: /不要|别|讨厌|雷区|底线|受不了/,
+};
+
+function profileDimension(fact) {
+  const slot = fact.slots?.find((item) => item.slot === '维度' && item.value?.kind === 'text');
+  return slot?.value?.value ?? '';
+}
+
+/**
+ * Core lines are always on; facets appear only when the message is about them.
+ *
+ * A whole person does not fit in a prompt, and a longer list of always-on lines is
+ * how a profile becomes wallpaper. Unlabelled lines (written before dimensions) stay
+ * in the core so nothing silently disappears.
+ */
+export function selectProfileFacts(facts, text, limit = 8) {
+  const picked = [];
+  for (const fact of facts) {
+    const dimension = profileDimension(fact);
+    if (!dimension || dimension === PROFILE_CORE_DIMENSION) {
+      picked.push(fact);
+      continue;
+    }
+    const trigger = FACET_TRIGGERS[dimension];
+    if (trigger && trigger.test(String(text ?? ''))) picked.push(fact);
+  }
+  return picked.slice(0, limit);
+}
 const RULE_LIMIT = 5;
 
 /** Session counters a rule can key on; unknown flags are simply false. */
@@ -487,7 +523,7 @@ function buildRelatedContext(text, state = {}) {
   // The profile is the merged description of the person; it is the only block that
   // is always on, so it goes first and stays short (ADR 0033).
   try {
-    const profile = ensureSoul().profile(8);
+    const profile = selectProfileFacts(ensureSoul().profile(30), text, 8);
     if (profile.length > 0) {
       const lines = profile.map((fact) => `- ${fact.statement}`).join('\n');
       parts.push(`<profile>\n${lines}\n</profile>`);
