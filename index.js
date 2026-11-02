@@ -471,6 +471,23 @@ export function renderHandoff(last, sessionId) {
   return lines.join('\n');
 }
 
+/**
+ * The sessions the user has archived in the workspace.
+ *
+ * `workspaceRegistry` is a Cordis service on the host context; archive is its
+ * durable set, not an event, so it is read at each turn. Absent service means an
+ * older or different host — the caller then falls back to the inactivity rule.
+ */
+function readArchivedSessions(ctx) {
+  try {
+    const registry = ctx.get?.('workspaceRegistry') ?? ctx.workspaceRegistry;
+    const ids = registry?.archivedSessionIds;
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [];
+  } catch (error) {
+    log(`archive list unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return [];
+  }
+}
 export function createPreStepHandler(deps) {
   /** sessionId -> last turn that received an injection */
   const injectedTurn = new Map();
@@ -532,12 +549,14 @@ export function createPreStepHandler(deps) {
       const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
       try {
         const closeConfig = readConfig();
-        const closed = ensureSoul().closeIdleThreads(
-          sessionId,
-          closeConfig.threadIdleTurns ?? 6,
-          (closeConfig.threadIdleMinutes ?? 30) * 60_000,
-          Date.now(),
-        );
+        const closed = ensureSoul().closeIdleThreads(sessionId, {
+          idleTurns: closeConfig.threadIdleTurns ?? 6,
+          idleMs: (closeConfig.threadIdleMinutes ?? 30) * 60_000,
+          // The host's own archive list: a session the user put away is finished
+          // by declaration, so its topics close immediately.
+          archivedSessionIds: deps.archivedSessions?.() ?? [],
+          at: Date.now(),
+        });
         if (closed.length > 0) {
           log(`threads closed: ${closed.join(',')}`);
           // A closed thread is the unit consolidation runs on — never a batch of
@@ -1324,7 +1343,7 @@ export function apply(ctx) {
   // request, and its waterfall can change the request.
   try {
     if (ctx.on) {
-      ctx.on('agent/pre-step', createPreStepHandler({ getContext: buildRelatedContext }));
+      ctx.on('agent/pre-step', createPreStepHandler({ getContext: buildRelatedContext, archivedSessions: () => readArchivedSessions(ctx) }));
       log('pre-step listener attached');
     }
   } catch (error) {
