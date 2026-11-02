@@ -88,14 +88,15 @@ function trace(record) {
 
 /**
  * Optional plugin config: ~/.soulbridge/plugin-config.json
- * { "distill": "rules" | "llm", "provider": "...", "model": "...", "maxLlmChars": 2000 }
+ * { "extract": "off" | "rules" | "llm", "provider": "...", "model": "...", "maxLlmChars": 2000 }
  *
- * Rules are the default. With "llm", the host model is asked only when the
- * rules found nothing, so it adds recall without overriding a rule that fired.
+ * One switch decides whether the host model exists for this plugin. It used to be
+ * two: `distill` created the model while the four stages checked `extract`, so the
+ * default (distill:'rules') left every stage believing a model was configured and
+ * silently returning false. `distill` is retired (docs/retirements.json).
  */
 const CONFIG_FILE = join(HOME, 'plugin-config.json');
 const CONFIG_DEFAULTS = {
-  distill: 'rules',
   provider: 'deepseek-account',
   model: 'deepseek-flash',
   maxLlmChars: 2000,
@@ -106,6 +107,17 @@ const CONFIG_DEFAULTS = {
   /** Minutes of silence after which another session counts as finished. */
   threadIdleMinutes: 1440,
 };
+
+/** The extraction mode: `off` writes nothing, `rules` uses the deterministic path. */
+export function llmMode(config = {}) {
+  const mode = config.extract ?? CONFIG_DEFAULTS.extract;
+  return mode === 'off' || mode === 'rules' ? mode : 'llm';
+}
+
+/** Is the host model available at all? Only `extract: 'llm'` provides it. */
+export function usesModel(config = {}) {
+  return llmMode(config) === 'llm';
+}
 
 function readConfig() {
   try {
@@ -142,8 +154,8 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-function makeLlm(ctx, config) {
-  if (config.distill !== 'llm') return undefined;
+export function makeLlm(ctx, config) {
+  if (!usesModel(config)) return undefined;
   // Resolve the service on first use: at apply() time the llm plugin may not be
   // registered yet, and the probe showed the call only works inside a turn.
   return async (prompt) => {
@@ -815,7 +827,13 @@ export function createPreStepHandler(deps) {
           trace({ event: 'threads-closed', closed });
           // A closed thread is the unit consolidation runs on — never a batch of
           // facts, which can mix two topics into one conclusion.
-          enqueueConsolidation(closed.map((thread) => thread.id));
+          // Without a model there is nothing to consolidate, and enqueuing anyway
+          // only fills the queue until the cap silently drops the newest threads.
+          if (usesModel(closeConfig)) {
+            enqueueConsolidation(closed.map((thread) => thread.id));
+          } else if (closed.length > 0) {
+            log(`consolidate: ${closed.length} closed thread(s) not queued (extract=${closeConfig.extract})`);
+          }
         }
       } catch (error) {
         log(`threads close failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1547,6 +1565,9 @@ export function enqueueClassifyCandidate(item) {
  */
 export function feedClassifyFromTurn(turnId) {
   try {
+    // Classification is a model stage. Without a model the candidate would sit in
+    // the queue until the cap drops it, so it is not queued at all.
+    if (!usesModel(readConfig())) return 0;
     const soul = ensureSoul();
     if (!soul.wasCorrectedTurn(turnId)) return 0;
     let added = 0;
@@ -2095,7 +2116,7 @@ export function apply(ctx) {
   const config = readConfig();
   injectedLlm = makeLlm(ctx, config);
   injectedMaxLlmChars = config.maxLlmChars;
-  log(`distill=${config.distill}${injectedLlm ? ' via host model' : ' (rules only)'}`);
+  log(`extract=${config.extract}${injectedLlm ? ' via host model' : ' (no model: rules only)'}`);
   // Backfill is triggered by the first user message, not here: at apply() time
   // the host model service is not mounted yet and every call fails.
 
