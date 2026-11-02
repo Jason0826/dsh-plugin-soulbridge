@@ -547,6 +547,21 @@ function readArchivedSessions(ctx) {
     return [];
   }
 }
+/**
+ * Run the per-step stages in priority order, stopping at the first that did work.
+ *
+ * A stage's boolean means "a model call was made", not "I was invoked": a stage
+ * that skips its work must return false so the next stage gets the one call this
+ * step is allowed. This function exists because that contract was implicit in an
+ * `if`, and a skip returning true starved the classifier for an hour.
+ */
+export async function runStageChain(stages) {
+  for (const stage of stages) {
+    if (await stage()) return true;
+  }
+  return false;
+}
+
 export function createPreStepHandler(deps) {
   /** sessionId -> last turn that received an injection */
   const injectedTurn = new Map();
@@ -587,17 +602,11 @@ export function createPreStepHandler(deps) {
     try {
       if (decision?.kind !== 'enter') return decision;
       // We are inside a live turn now, which is the only place the host model is
-      // callable. Extraction first, consolidation only if extraction had nothing:
-      // one model call per step keeps every call inside that window.
+      // callable. Stages run in priority order and a stage that skipped its work
+      // must not claim the call — that is how the classifier starved for an hour.
       void (async () => {
         try {
-          const extracted = await drainExtractionQueue();
-          if (!extracted) {
-            const consolidated = await runConsolidationStep();
-            // Old lessons still need their rule/profile split before rules can fire;
-            // it runs last so live conversation always wins the one call per step.
-            if (!consolidated) await runClassifyStep();
-          }
+          await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep]);
         } catch (error) {
           log(`background: ${error instanceof Error ? error.message : String(error)}`);
         }
