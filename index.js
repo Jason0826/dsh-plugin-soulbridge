@@ -343,7 +343,11 @@ const ANCHOR = { types: ['strategy', 'fact', 'trait'], minImportance: 8, maxItem
  */
 function buildInjection() {
   try {
-    const result = ensureSoul().context({ track: false, includeAnchors: false });
+    // includeAffect:false — the affect sample changes almost every turn, and this
+    // section is `in-history`: DSH appends a new prompt version whenever the text
+    // changes. Injected affect therefore goes through the pre-step message (where
+    // the anchors call puts it), not here.
+    const result = ensureSoul().context({ track: false, includeAnchors: false, includeAffect: false });
     const text = result.text;
     const hash = hashText(text);
     if (hash !== lastSectionHash) {
