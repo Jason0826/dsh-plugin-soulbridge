@@ -35,6 +35,8 @@ import {
   parseConclusionDraft,
   parseVerificationDraft,
   readVerification,
+  escapeAttr,
+  escapeBlockText,
 } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
@@ -484,11 +486,11 @@ export function buildFactHooks(text, options = {}) {
         if (seen.has(fact.id)) continue;
         seen.add(fact.id);
         const when = fact.atText ?? (fact.at ? new Date(fact.at).toISOString().slice(0, 10) : '');
-        lines.push(`- [${fact.id}] ${fact.statement}${when ? `（${when}）` : ''}`);
+        lines.push(`- [${fact.id}] ${escapeBlockText(fact.statement)}${when ? `（${escapeBlockText(when)}）` : ''}`);
         used.push(fact.id);
       }
       if (lines.length > 0) {
-        parts.push(`<about name="${entity.name}">\n${lines.join('\n')}\n</about>`);
+        parts.push(`<about name="${escapeAttr(entity.name)}">\n${lines.join('\n')}\n</about>`);
       }
     }
   } catch (error) {
@@ -559,7 +561,9 @@ export function buildRuleState(state = {}) {
 export function renderRulesBlock(rules) {
   if (!Array.isArray(rules) || rules.length === 0) return '';
   const ids = rules.map((rule) => rule.id).join(',');
-  const lines = rules.map((rule) => `- ${rule.statement}`).join('\n');
+  // Rule statements derive from lessons, which come from user text: escape them like
+  // any other content, or a lesson can close the block and forge a new requirement.
+  const lines = rules.map((rule) => `- ${escapeBlockText(rule.statement)}`).join('\n');
   return `<rules fired="${ids}">\n${lines}\n</rules>`;
 }
 
@@ -571,7 +575,7 @@ function buildRelatedContext(text, state = {}) {
   try {
     const profile = selectProfileFacts(ensureSoul().profile(30), text, 8);
     if (profile.length > 0) {
-      const lines = profile.map((fact) => `- ${fact.statement}`).join('\n');
+      const lines = profile.map((fact) => `- ${escapeBlockText(fact.statement)}`).join('\n');
       parts.push(`<profile>\n${lines}\n</profile>`);
       used.push(...profile.map((fact) => fact.id));
     }
@@ -616,14 +620,17 @@ function buildRelatedContext(text, state = {}) {
       const timeline = ensureSoul().latestAbout(plan.subject, { query: text, limit: 3 });
       if (timeline.length > 0) {
         const body = timeline
-          .map((fact) => `- [${fact.id}] ${fact.atText ? `${fact.atText} ` : ''}${fact.statement}`)
+          .map(
+            (fact) =>
+              `- [${fact.id}] ${fact.atText ? `${escapeBlockText(fact.atText)} ` : ''}${escapeBlockText(fact.statement)}`,
+          )
           .join('\n');
-        parts.push(`<about-now name="${plan.subject}">\n${body}\n</about-now>`);
+        parts.push(`<about-now name="${escapeAttr(plan.subject)}">\n${body}\n</about-now>`);
         used.push(...timeline.map((fact) => fact.id));
       } else {
         // Saying "nothing" explicitly is better than letting a relevance search
         // fill the gap with somebody else's memories.
-        parts.push(`<about-now name="${plan.subject}">（没有任何关于它的记忆）</about-now>`);
+        parts.push(`<about-now name="${escapeAttr(plan.subject)}">（没有任何关于它的记忆）</about-now>`);
       }
     } catch (error) {
       log(`timeline failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -632,7 +639,9 @@ function buildRelatedContext(text, state = {}) {
   if (policy.related) {
     const pairs = ensureSoul().recallTurnPairs(text);
     if (pairs.length > 0) {
-      const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
+      const body = pairs
+        .map((pair) => `- [Q] ${escapeBlockText(pair.userText)}\n  [A] ${escapeBlockText(pair.assistantText)}`)
+        .join('\n');
       parts.push(`<related>\n${body}\n</related>`);
       used.push(...pairs.map((pair) => pair.id));
     }
@@ -675,10 +684,12 @@ function buildRelatedContext(text, state = {}) {
 export function renderHandoff(last, sessionId) {
   if (!last || last.thread.sessionId === sessionId) return '';
   const when = new Date(last.thread.closedAt ?? Date.now()).toISOString().slice(0, 10);
-  const lines = [`<handoff topic="${last.thread.topic.slice(0, 30)}" closed="${when}">`];
-  if (last.conclusion) lines.push(`  上次的结论：${last.conclusion.statement}`);
+  // Topic and turn text are user words: escape them, or a pasted `</handoff>` ends
+  // the block and everything after it reads as ordinary conversation.
+  const lines = [`<handoff topic="${escapeAttr(last.thread.topic.slice(0, 30))}" closed="${when}">`];
+  if (last.conclusion) lines.push(`  上次的结论：${escapeBlockText(last.conclusion.statement)}`);
   for (const turn of last.turns) {
-    lines.push(`  ${turn.turnNo}. 用户：${turn.userText.replace(/\s+/g, ' ').slice(0, 80)}`);
+    lines.push(`  ${turn.turnNo}. 用户：${escapeBlockText(turn.userText.replace(/\s+/g, ' ').slice(0, 80))}`);
   }
   lines.push('</handoff>');
   return lines.join('\n');
