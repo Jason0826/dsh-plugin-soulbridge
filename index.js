@@ -386,12 +386,15 @@ export function mentions(text, entity) {
   return false;
 }
 
-export function buildFactHooks(text) {
+export function buildFactHooks(text, options = {}) {
   const parts = [];
   const used = [];
   try {
     const known = ensureSoul().findEntities('', 50);
-    const mentioned = known.filter((entity) => mentions(text, entity));
+    // The entity timeline already covers the subject of an entity question;
+    // injecting both produced two copies of the same facts in one prompt.
+    const skip = new Set(options.skip ?? []);
+    const mentioned = known.filter((entity) => mentions(text, entity) && !skip.has(entity.name));
     for (const entity of mentioned.slice(0, 3)) {
       const earliest = ensureSoul().factsAbout(entity.id, { order: 'asc', limit: 1 });
       const recent = ensureSoul().factsAbout(entity.id, { limit: 4 });
@@ -457,7 +460,7 @@ function buildRelatedContext(text) {
   } catch (error) {
     log(`prestep: anchors failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const hooks = buildFactHooks(text);
+  const hooks = buildFactHooks(text, { skip: policy.timeline && plan?.subject ? [plan.subject] : [] });
   if (hooks && hooks.text) {
     parts.push(hooks.text);
     used.push(...hooks.used);
@@ -491,7 +494,7 @@ function buildRelatedContext(text) {
   if (parts.length === 0) return '';
   // Retrieval practice: a fact that keeps being surfaced decays more slowly.
   try {
-    ensureSoul().recordRecalls(used.filter((id) => String(id).startsWith('fc_')));
+    ensureSoul().recordRecalls([...new Set(used)].filter((id) => String(id).startsWith('fc_')));
   } catch (error) {
     log(`recordRecalls failed: ${error instanceof Error ? error.message : String(error)}`);
   }
