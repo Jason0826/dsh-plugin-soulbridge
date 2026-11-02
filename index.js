@@ -93,7 +93,7 @@ const CONFIG_DEFAULTS = {
   /** Turns of silence that end a topic thread. Lowered temporarily for tests. */
   threadIdleTurns: 6,
   /** Minutes of silence after which another session counts as finished. */
-  threadIdleMinutes: 30,
+  threadIdleMinutes: 1440,
 };
 
 function readConfig() {
@@ -558,10 +558,14 @@ export function createPreStepHandler(deps) {
           at: Date.now(),
         });
         if (closed.length > 0) {
-          log(`threads closed: ${closed.join(',')}`);
+          // The reason is logged because a threshold that fires too early must be
+          // visible: a topic closed by a guess is a partial conclusion written to
+          // durable memory.
+          log(`threads closed: ${closed.map((thread) => `${thread.id}(${thread.reason})`).join(',')}`);
+          trace({ event: 'threads-closed', closed });
           // A closed thread is the unit consolidation runs on — never a batch of
           // facts, which can mix two topics into one conclusion.
-          enqueueConsolidation(closed);
+          enqueueConsolidation(closed.map((thread) => thread.id));
         }
       } catch (error) {
         log(`threads close failed: ${error instanceof Error ? error.message : String(error)}`);
