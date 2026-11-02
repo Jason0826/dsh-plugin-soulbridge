@@ -90,6 +90,8 @@ const CONFIG_DEFAULTS = {
   maxLlmChars: 2000,
   /** off | rules | llm — who writes entities/facts from a finished turn (ADR 0029). */
   extract: 'llm',
+  /** Turns of silence that end a topic thread. Lowered temporarily for tests. */
+  threadIdleTurns: 6,
 };
 
 function readConfig() {
@@ -514,7 +516,7 @@ export function createPreStepHandler(deps) {
       // Topics the conversation has moved past, closed once per turn. Pure
       // arithmetic on turn numbers — no model, so it cannot fail softly.
       try {
-        const closed = ensureSoul().closeIdleThreads(Number(payload?.turn ?? 0), 6, Date.now());
+        const closed = ensureSoul().closeIdleThreads(Number(payload?.turn ?? 0), readConfig().threadIdleTurns ?? 6, Date.now());
         if (closed.length > 0) {
           log(`threads closed: ${closed.join(',')}`);
           // A closed thread is the unit consolidation runs on — never a batch of
