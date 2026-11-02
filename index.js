@@ -415,9 +415,32 @@ export function buildFactHooks(text) {
   return { text: parts.join('\n\n'), used };
 }
 
+/**
+ * Which injection blocks a plan allows.
+ *
+ * When the question names a subject, the entity timeline is the answer and the
+ * related-pairs search is the contamination: it is how "上次和 a 吃饭" ends up
+ * answered with something about b. So the plan chooses one or the other.
+ */
+export function planBlocks(plan) {
+  if (!plan) return { related: true, timeline: false };
+  if (plan.primitive === 'entity') return { related: false, timeline: true };
+  return { related: true, timeline: false };
+}
+
 function buildRelatedContext(text) {
   const parts = [];
   const used = [];
+  // The plan is computed first because it decides which blocks are allowed.
+  let plan = null;
+  try {
+    plan = ensureSoul().planRetrieval(text);
+    log(`router: ${plan.primitive}${plan.subject ? `(${plan.subject})` : ''} — ${plan.reason}`);
+    trace({ event: 'router', primitive: plan.primitive, subject: plan.subject ?? null, reason: plan.reason });
+  } catch (error) {
+    log(`router failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const policy = planBlocks(plan);
   try {
     // Anchors moved here from the system prompt: a message is counted once and
     // compacted normally, while a changed prompt becomes a new prompt version.
@@ -439,29 +462,31 @@ function buildRelatedContext(text) {
     parts.push(hooks.text);
     used.push(...hooks.used);
   }
-  const pairs = ensureSoul().recallTurnPairs(text);
-  if (pairs.length > 0) {
-    const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
-    parts.push(`<related>\n${body}\n</related>`);
-    used.push(...pairs.map((pair) => pair.id));
-  }
-  // Which primitive this question wanted, and whether the answer came from the
-  // right subject. Logged because a wrong subject is the one error worse than
-  // saying nothing, and it is invisible without the plan.
-  try {
-    const plan = ensureSoul().planRetrieval(text);
-    log(`router: ${plan.primitive}${plan.subject ? `(${plan.subject})` : ''} — ${plan.reason}`);
-    trace({ event: 'router', primitive: plan.primitive, subject: plan.subject ?? null, reason: plan.reason });
-    if (plan.primitive === 'entity' && plan.subject) {
+  if (policy.timeline && plan?.subject) {
+    try {
       const timeline = ensureSoul().latestAbout(plan.subject, { limit: 3 });
       if (timeline.length > 0) {
-        const body = timeline.map((fact) => `- [${fact.id}] ${fact.atText ? `${fact.atText} ` : ''}${fact.statement}`).join('\n');
+        const body = timeline
+          .map((fact) => `- [${fact.id}] ${fact.atText ? `${fact.atText} ` : ''}${fact.statement}`)
+          .join('\n');
         parts.push(`<about-now name="${plan.subject}">\n${body}\n</about-now>`);
         used.push(...timeline.map((fact) => fact.id));
+      } else {
+        // Saying "nothing" explicitly is better than letting a relevance search
+        // fill the gap with somebody else's memories.
+        parts.push(`<about-now name="${plan.subject}">（没有任何关于它的记忆）</about-now>`);
       }
+    } catch (error) {
+      log(`timeline failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  } catch (error) {
-    log(`router failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (policy.related) {
+    const pairs = ensureSoul().recallTurnPairs(text);
+    if (pairs.length > 0) {
+      const body = pairs.map((pair) => `- [Q] ${pair.userText}\n  [A] ${pair.assistantText}`).join('\n');
+      parts.push(`<related>\n${body}\n</related>`);
+      used.push(...pairs.map((pair) => pair.id));
+    }
   }
   if (parts.length === 0) return '';
   // Retrieval practice: a fact that keeps being surfaced decays more slowly.
