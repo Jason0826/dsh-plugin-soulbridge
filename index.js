@@ -1082,19 +1082,25 @@ async function runClassifyStep() {
   const soul = ensureSoul();
   let rules = 0;
   let profiles = 0;
+  let pending = 0;
   const known = new Set(batch.map((item) => item.id));
   for (const item of classified) {
     if (!known.has(item.id)) continue;
     if (item.kind === 'rule' && item.trigger) {
       soul.markRule(item.id, { trigger: item.trigger, action: item.action });
       rules += 1;
-    } else {
+    } else if (item.kind === 'profile') {
       soul.markProfile(item.id);
       profiles += 1;
+    } else {
+      // Neither bucket is safe for an unclassifiable lesson: a rule would fire
+      // every turn, a profile line would put an imperative into a person.
+      soul.markUnclassified(item.id);
+      pending += 1;
     }
   }
-  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles}`);
-  trace({ event: 'classify', batch: batch.length, rules, profiles });
+  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}`);
+  trace({ event: 'classify', batch: batch.length, rules, profiles, pending });
   return true;
 }
 /**
