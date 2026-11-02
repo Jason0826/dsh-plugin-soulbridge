@@ -1303,11 +1303,24 @@ function rememberTool() {
     async execute(args) {
       try {
         const content = String(args?.content ?? '').trim();
-        const type = typeof args?.type === 'string' ? args.type : undefined;
-        const importance = args?.importance === undefined ? undefined : Number(args.importance);
-        const result = ensureSoul().rememberExplicit({ content, type, importance });
-        log(`tool soul_remember: ok=${result.ok} duplicate=${result.duplicate ?? false}`);
-        return result;
+        if (!content) return { ok: false, reason: 'empty content' };
+        const type = typeof args?.type === 'string' ? args.type : 'strategy';
+        const importance = args?.importance === undefined ? 7 : Number(args.importance);
+        // Explicit memories are lessons in the two-layer model (ADR 0032): a fact
+        // held by the soul itself, not a row in the retired memories table.
+        const mapped = type === 'cognition' ? '原则' : type === 'trait' ? '性格' : type === 'fact' ? '事实' : '教训';
+        const soul = ensureSoul();
+        const duplicate = soul.recentFacts(500).find((fact) => fact.statement === content && fact.status !== 'superseded');
+        if (duplicate) return { ok: true, id: duplicate.id, duplicate: true };
+        const fact = soul.recordFact({
+          statement: content,
+          typeName: mapped,
+          holder: 'self',
+          source: 'told',
+          confidence: Math.min(1, Math.max(0, (Number.isFinite(importance) ? importance : 7) / 10)),
+        });
+        log(`tool soul_remember: ok=true type=${mapped} id=${fact.id}`);
+        return { ok: true, id: fact.id };
       } catch (error) {
         return { ok: false, reason: error instanceof Error ? error.message : String(error) };
       }
