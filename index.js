@@ -92,6 +92,8 @@ const CONFIG_DEFAULTS = {
   extract: 'llm',
   /** Turns of silence that end a topic thread. Lowered temporarily for tests. */
   threadIdleTurns: 6,
+  /** Minutes of silence after which another session counts as finished. */
+  threadIdleMinutes: 30,
 };
 
 function readConfig() {
@@ -529,7 +531,13 @@ export function createPreStepHandler(deps) {
       // numeric difference closed a topic one message after it opened.
       const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
       try {
-        const closed = ensureSoul().closeIdleThreads(sessionId, readConfig().threadIdleTurns ?? 6, Date.now());
+        const closeConfig = readConfig();
+        const closed = ensureSoul().closeIdleThreads(
+          sessionId,
+          closeConfig.threadIdleTurns ?? 6,
+          (closeConfig.threadIdleMinutes ?? 30) * 60_000,
+          Date.now(),
+        );
         if (closed.length > 0) {
           log(`threads closed: ${closed.join(',')}`);
           // A closed thread is the unit consolidation runs on — never a batch of
