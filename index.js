@@ -24,6 +24,8 @@ import {
   renderConsolidationPrompt,
   renderRelationPrompt,
   renderRuleClassifyPrompt,
+  renderProfileMergePrompt,
+  parseProfileMerge,
   parseRuleClassifications,
   selectRules,
   renderVerificationPrompt,
@@ -455,6 +457,18 @@ export function renderRulesBlock(rules) {
 function buildRelatedContext(text, state = {}) {
   const parts = [];
   const used = [];
+  // The profile is the merged description of the person; it is the only block that
+  // is always on, so it goes first and stays short (ADR 0033).
+  try {
+    const profile = ensureSoul().profile(8);
+    if (profile.length > 0) {
+      const lines = profile.map((fact) => `- ${fact.statement}`).join('\n');
+      parts.push(`<profile>\n${lines}\n</profile>`);
+      used.push(...profile.map((fact) => fact.id));
+    }
+  } catch (error) {
+    log(`profile block failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   // The plan is computed first because it decides which blocks are allowed.
   let plan = null;
   try {
@@ -647,7 +661,7 @@ export function createPreStepHandler(deps) {
         stageChainBusy = true;
         void (async () => {
           try {
-            await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep]);
+            await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep, runProfileStep]);
           } catch (error) {
             log(`background: ${error instanceof Error ? error.message : String(error)}`);
           } finally {
@@ -1199,6 +1213,90 @@ function finishConclusion(soul, draft, { threadId, batch, relation }) {
   writeConsolidationState({ pending: null });
 }
 
+/* ------------------------------------------------------------------ *
+ * Profile merging: many judgments about the person → a few (ADR 0033)
+ * ------------------------------------------------------------------ */
+
+const PROFILE_FILE = join(HOME, 'pending-profile.json');
+
+function readProfileQueue() {
+  try {
+    const raw = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeProfileQueue(queue) {
+  try {
+    writeFileSync(PROFILE_FILE, JSON.stringify(queue.slice(0, 200), null, 2), 'utf8');
+  } catch (error) {
+    log(`profile queue write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function peekProfileQueue() {
+  return readProfileQueue();
+}
+
+export function commitProfileMerge(ids) {
+  const done = new Set(ids);
+  writeProfileQueue(readProfileQueue().filter((item) => !done.has(item.id)));
+}
+
+export function retryProfileMerge(batch) {
+  const retry = new Map(batch.map((item) => [item.id, item]));
+  const out = [];
+  for (const item of readProfileQueue()) {
+    if (!retry.has(item.id)) {
+      out.push(item);
+      continue;
+    }
+    const attempts = (item.attempts ?? 0) + 1;
+    if (attempts >= 3) {
+      log(`profile: giving up on ${item.id} after ${attempts} attempts`);
+      trace({ event: 'profile-abandoned', id: item.id, attempts });
+      continue;
+    }
+    out.push({ ...item, attempts });
+  }
+  writeProfileQueue(out);
+}
+
+/**
+ * One merge per quiet step.
+ *
+ * The sources stay in the queue until the merged lines are written: a failed or
+ * empty reply must not cost the judgments it was supposed to compress.
+ */
+async function runProfileStep() {
+  const config = readConfig();
+  if (config.extract === 'off' || !injectedLlm) return false;
+  const batch = peekProfileQueue();
+  if (batch.length < 2) return false;
+
+  let raw;
+  try {
+    raw = await injectedLlm(renderProfileMergePrompt({ items: batch }));
+  } catch (error) {
+    log(`profile: call failed (${error instanceof Error ? error.message : String(error)}) — retrying`);
+    retryProfileMerge(batch);
+    return true;
+  }
+  const allowed = new Set(batch.map((item) => item.id));
+  const lines = parseProfileMerge(raw, allowed);
+  if (lines.length === 0) {
+    log('profile: no usable merge in the reply — retrying');
+    retryProfileMerge(batch);
+    return true;
+  }
+  const written = ensureSoul().applyProfileMerge(lines);
+  commitProfileMerge(batch.map((item) => item.id));
+  log(`profile merged: sources=${batch.length} lines=${written.length}`);
+  trace({ event: 'profile', sources: batch.length, lines: written.length });
+  return true;
+}
 /* ------------------------------------------------------------------ *
  * Classifying old lessons: rule (with trigger) or profile (ADR 0033)
  * ------------------------------------------------------------------ */

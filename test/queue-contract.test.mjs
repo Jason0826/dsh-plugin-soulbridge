@@ -45,3 +45,17 @@ test('queue: committing removes exactly the applied batch', () => {
   mod.commitClassifyBatch(['fc_a', 'fc_b']);
   assert.deepEqual(read().map((item) => item.id), ['fc_c']);
 });
+
+test('profile queue: sources survive a failed merge and are removed after it', () => {
+  const profileFile = join(home, 'pending-profile.json');
+  writeFileSync(profileFile, JSON.stringify([{ id: 'fc_a', statement: 'a' }, { id: 'fc_b', statement: 'b' }]), 'utf8');
+
+  const batch = mod.peekProfileQueue();
+  assert.equal(batch.length, 2, 'peeking does not consume the sources');
+
+  mod.retryProfileMerge(batch);
+  assert.equal(JSON.parse(readFileSync(profileFile, 'utf8'))[0].attempts, 1);
+
+  mod.commitProfileMerge(['fc_a', 'fc_b']);
+  assert.equal(JSON.parse(readFileSync(profileFile, 'utf8')).length, 0);
+});
