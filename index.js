@@ -1315,9 +1315,15 @@ export function retryProfileMerge(batch) {
  */
 async function runProfileStep() {
   const config = readConfig();
-  if (config.extract === 'off' || !injectedLlm) return false;
+  if (config.extract === 'off' || !injectedLlm) {
+    log('profile: skipped — model unavailable');
+    return false;
+  }
   const batch = peekProfileQueue();
-  if (batch.length < 2) return false;
+  if (batch.length < 2) {
+    if (batch.length === 1) log('profile: one item queued, nothing to merge yet');
+    return false;
+  }
 
   let raw;
   try {
