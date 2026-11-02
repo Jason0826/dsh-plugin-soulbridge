@@ -118,7 +118,12 @@ function readConfig() {
 let currentTurn;
 let currentStep;
 
-const LLM_TIMEOUT_MS = 60_000;
+// Measured, not guessed: 279 calls, p50=1.7s p90=6.8s p99=46.7s, max=142.9s.
+// 90s is ~2x p99 and caps a hung call without cutting the ordinary tail.
+// Re-measure with scripts/latency.mjs before changing it.
+const LLM_TIMEOUT_MS = 95_000;
+/** Three times one call, so a slow stage cannot hold the chain past a retry cycle. */
+const CHAIN_TIMEOUT_MS = 285_000;
 /** A hung model call must fail, not hold the whole stage chain forever. */
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
@@ -695,7 +700,7 @@ export function createPreStepHandler(deps) {
             await Promise.race([
               runStageChain(stages),
               new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('stage chain timed out')), 120_000),
+                setTimeout(() => reject(new Error('stage chain timed out')), CHAIN_TIMEOUT_MS),
               ),
             ]);
           } catch (error) {
