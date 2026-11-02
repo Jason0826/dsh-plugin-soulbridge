@@ -21,7 +21,10 @@ import {
   Soul,
   detectCorrection,
   renderConsolidationPrompt,
+  renderRelationPrompt,
   renderVerificationPrompt,
+  parseRelationDraft,
+  normalizeStatement,
   parseConclusionDraft,
   parseVerificationDraft,
 } from 'soulbridge';
@@ -930,6 +933,47 @@ function writeConsolidationState(state) {
 }
 
 /**
+ * Write (or merge) the conclusion and close the thread with it.
+ *
+ * Merging never rewrites the held statement — the evidence is what grows, so the
+ * merge stays auditable. Refine and conflict still write a new row and supersede
+ * the old one, which keeps the chain of revisions.
+ */
+function finishConclusion(soul, draft, { threadId, batch, relation }) {
+  const allowed = batch.map((fact) => fact.id);
+  let result;
+  if (relation.kind === 'duplicate' && relation.target) {
+    result = soul.recordConclusion(draft, { allowed, mergeInto: relation.target });
+  } else {
+    const effective =
+      (relation.kind === 'refine' || relation.kind === 'conflict') && relation.target
+        ? { ...draft, supersedes: relation.target }
+        : draft;
+    result = soul.recordConclusion(effective, { allowed });
+  }
+  const summaryId = result.merged ?? result.fact?.id;
+  // The conclusion becomes the thread's summary; a closed thread with no summary
+  // is still closed, it just has nothing to remember it by.
+  if (result.ok && threadId && summaryId) soul.store.closeThread(threadId, Date.now(), summaryId);
+  log(
+    `consolidate ok: thread=${threadId ?? '-'} relation=${relation.kind} "${draft.statement}" ` +
+      `evidence=${draft.evidence.length} written=${Boolean(result.fact)} merged=${result.merged ?? '-'} ` +
+      `superseded=${result.superseded ?? '-'}`,
+  );
+  trace({
+    event: 'consolidate',
+    verdict: 'supported',
+    ok: result.ok,
+    reason: result.reason,
+    relation: relation.kind,
+    target: relation.target ?? null,
+    statement: draft.statement,
+    thread: threadId,
+  });
+  writeConsolidationState({ pending: null });
+}
+
+/**
  * One consolidation step per call, never two model calls in one step.
  *
  * Consolidation runs on a **closed thread**, not on a batch of facts: a
@@ -954,22 +998,15 @@ async function runConsolidationStep() {
     const raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
     const verdict = parseVerificationDraft(raw) ?? { verdict: 'unsupported', reason: 'unparseable verdict' };
     if (verdict.verdict === 'supported') {
-      const result = soul.recordConclusion(draft, { allowed: batch.map((fact) => fact.id) });
-      // The conclusion becomes the thread's summary; a closed thread with no
-      // summary is still closed, it just has nothing to remember it by.
-      if (result.ok && threadId) soul.store.closeThread(threadId, Date.now(), result.fact?.id);
-      log(
-        `consolidate ok: thread=${threadId ?? '-'} "${draft.statement}" evidence=${draft.evidence.length} ` +
-          `written=${result.ok}${result.superseded ? ' superseded=1' : ''}`,
-      );
-      trace({
-        event: 'consolidate',
-        verdict: 'supported',
-        ok: result.ok,
-        reason: result.reason,
-        statement: draft.statement,
-        thread: threadId,
-      });
+      // Supported, but not yet written: first ask whether we already hold it.
+      // The check runs in its own step so this step keeps to one model call.
+      const candidates = soul.conclusionCandidates(draft.evidence, 8);
+      if (candidates.length > 0) {
+        writeConsolidationState({ pending: { phase: 'dedupe', draft, batch, threadId, candidates } });
+        log(`consolidate verify ok: thread=${threadId ?? '-'} — checking ${candidates.length} held conclusions`);
+        return true;
+      }
+      finishConclusion(soul, draft, { threadId, batch, relation: { kind: 'unrelated' } });
     } else {
       // Partial support is dropped, not downgraded: a half-true conclusion is a
       // wrong one, and the sample is what teaches the prompt next time.
@@ -984,6 +1021,31 @@ async function runConsolidationStep() {
       });
     }
     writeConsolidationState({ pending: null });
+    return true;
+  }
+
+  if (state.pending?.phase === 'dedupe') {
+    const { draft, batch, threadId, candidates } = state.pending;
+    // The one check a rule can make safely: the same text. A hit cannot be wrong,
+    // and it costs nothing.
+    const exact = candidates.find(
+      (candidate) => normalizeStatement(candidate.statement) === normalizeStatement(draft.statement),
+    );
+    if (exact) {
+      log(`dedupe: exact duplicate of ${exact.id} — merging evidence, not writing`);
+      finishConclusion(soul, draft, { threadId, batch, relation: { kind: 'duplicate', target: exact.id } });
+      return true;
+    }
+    const raw = await injectedLlm(renderRelationPrompt({ conclusion: draft.statement, existing: candidates }));
+    const parsed = parseRelationDraft(raw);
+    // An id we did not offer is a hallucination; treating it as unrelated only
+    // ever writes the new conclusion, never deletes one.
+    const known = parsed?.target && candidates.some((candidate) => candidate.id === parsed.target);
+    const relation =
+      parsed && (parsed.kind === 'unrelated' || known) ? parsed : { kind: 'unrelated', reason: 'unknown target' };
+    log(`dedupe: ${relation.kind}${relation.target ? ` → ${relation.target}` : ''} "${draft.statement}"`);
+    trace({ event: 'dedupe', relation: relation.kind, target: relation.target ?? null, reason: relation.reason });
+    finishConclusion(soul, draft, { threadId, batch, relation });
     return true;
   }
 
