@@ -273,3 +273,16 @@ test('turn boundary is an event, not a silence', async () => {
   assert.equal(source.includes('scheduleFlush'), false, 'nothing may schedule a timed flush');
   assert.match(source, /if \(type === 'turn\/end'\)/);
 });
+
+test('stage chain: its deadline is cancelled when the chain wins', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  // The race used to leave its 285s timer running after the chain finished: a leak
+  // on every step, and the reason this file printed every result and then hung.
+  assert.match(source, /clearTimeout\(chainTimer\)/, 'the chain deadline must be cleared');
+  assert.equal(
+    source.includes("new Promise((_, reject) =>\n        setTimeout(() => reject(new Error('stage chain timed out'))"),
+    false,
+    'the un-cleared race must not come back',
+  );
+});

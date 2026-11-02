@@ -26,6 +26,7 @@ import {
   renderRuleClassifyPrompt,
   renderProfileMergePrompt,
   parseProfileMerge,
+  groupProfileCandidates,
   parseRuleClassifications,
   selectRules,
   renderVerificationPrompt,
@@ -727,18 +728,26 @@ export function createPreStepHandler(deps) {
             // Fairness: a long consolidation backlog used to consume every step, so
             // the profile merge never got a turn. The profile alternates with the
             // rest of the chain instead of always queueing behind it.
-            const profilePending = peekProfileQueue().length >= 2;
+            // "Pending" means a dimension group has at least two judgments in it: a
+            // queue of singletons has nothing to collapse and must not hold a slot.
+            const profilePending = hasMergeableGroup(peekProfileQueue());
             const stages = [drainExtractionQueue];
             if (profilePending && stageTick % 2 === 0) stages.push(runProfileStep);
             stages.push(runConsolidationStep, runClassifyStep);
             if (profilePending && stageTick % 2 === 1) stages.push(runProfileStep);
             stageTick += 1;
-            await Promise.race([
-              runStageChain(stages),
-              new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('stage chain timed out')), CHAIN_TIMEOUT_MS),
-              ),
-            ]);
+            // The timeout has to be cancelled when the chain wins the race. Left
+            // alone it stays a live timer for the full 285s — a leak per step, and
+            // the reason `node --test` printed every result and then never exited.
+            let chainTimer;
+            const chainDeadline = new Promise((_, reject) => {
+              chainTimer = setTimeout(() => reject(new Error('stage chain timed out')), CHAIN_TIMEOUT_MS);
+            });
+            try {
+              await Promise.race([runStageChain(stages), chainDeadline]);
+            } finally {
+              clearTimeout(chainTimer);
+            }
           } catch (error) {
             log(`background: ${error instanceof Error ? error.message : String(error)}`);
           } finally {
@@ -1344,10 +1353,12 @@ export function retryProfileMerge(batch) {
 }
 
 /**
- * One merge per quiet step.
+ * One merge per quiet step, always inside a single dimension.
  *
- * The sources stay in the queue until the merged lines are written: a failed or
- * empty reply must not cost the judgments it was supposed to compress.
+ * Sending every queued judgment in one call welded unrelated ones into one sentence,
+ * which is why the batches are now cut by dimension before the model sees them. The
+ * biggest group goes first: it holds the most repetition, so it is where a call buys
+ * the most. A group of one has nothing to merge and waits for company.
  */
 async function runProfileStep() {
   const config = readConfig();
@@ -1355,22 +1366,26 @@ async function runProfileStep() {
     log('profile: skipped — model unavailable');
     return false;
   }
-  const batch = peekProfileQueue();
-  if (batch.length < 2) {
-    if (batch.length === 1) log('profile: one item queued, nothing to merge yet');
+  const groups = groupProfileCandidates(peekProfileQueue());
+  const [group] = mergeableGroups(groups);
+  if (!group) {
+    if (groups.length > 0) log(`profile: nothing to merge yet (${describeGroups(groups)})`);
     return false;
   }
+  const batch = group.items;
+  const dimension = group.dimension;
+  log(`profile: merging ${describeGroups(groups)} — picking ${dimension} x${batch.length}`);
 
   let raw;
   try {
-    raw = await injectedLlm(renderProfileMergePrompt({ items: batch }));
+    raw = await injectedLlm(renderProfileMergePrompt({ items: batch, dimension }));
   } catch (error) {
     log(`profile: call failed (${error instanceof Error ? error.message : String(error)}) — retrying`);
     retryProfileMerge(batch);
     return true;
   }
   const allowed = new Set(batch.map((item) => item.id));
-  const lines = parseProfileMerge(raw, allowed);
+  const lines = parseProfileMerge(raw, allowed, dimension);
   if (lines.length === 0) {
     log('profile: no usable merge in the reply — retrying');
     retryProfileMerge(batch);
@@ -1389,11 +1404,41 @@ async function runProfileStep() {
   }
   commitProfileMerge(batch.map((item) => item.id));
   log(
-    `profile merged: sources=${batch.length} lines=${written.length}` +
+    `profile merged: dimension=${dimension} sources=${batch.length} lines=${written.length}` +
       ` covered=${covered.size} retired=${leftovers.length}`,
   );
-  trace({ event: 'profile', sources: batch.length, lines: written.length, retired: leftovers.length });
+  trace({
+    event: 'profile',
+    dimension,
+    sources: batch.length,
+    lines: written.length,
+    retired: leftovers.length,
+  });
   return true;
+}
+
+/** "工作方式:5,沟通偏好:2,未标注:1" — the queue in one readable line. */
+export function describeGroups(groups) {
+  return groups
+    .map((group) => `${group.dimension || '未标注'}:${group.items.length}`)
+    .join(',');
+}
+
+/**
+ * The groups a merge may run on: one dimension, at least two judgments.
+ *
+ * Unlabelled judgments are deliberately excluded. Merging them would put several
+ * lenses back into one call — the welding the split exists to stop — and assigning a
+ * dimension just to fill a batch would be invention. They are reported instead, and
+ * labelled by hand (scripts/label-profile.mjs) before they can be merged.
+ */
+export function mergeableGroups(groups) {
+  return groups.filter((group) => group.dimension && group.items.length >= 2);
+}
+
+/** Is there any group with at least two judgments to collapse? */
+export function hasMergeableGroup(queue) {
+  return mergeableGroups(groupProfileCandidates(queue)).length > 0;
 }
 /* ------------------------------------------------------------------ *
  * Classifying old lessons: rule (with trigger) or profile (ADR 0033)
