@@ -1328,6 +1328,21 @@ export function peekProfileQueue() {
   return readProfileQueue();
 }
 
+/**
+ * Add one judged-about-the-person item to the merge queue.
+ *
+ * Read and write the file in one go: a snapshot taken before a model call once
+ * overwrote items enqueued while the call was in flight, silently losing turns.
+ * The dimension comes along because the merge step cuts its batches along it.
+ */
+export function enqueueProfileCandidate(item) {
+  if (!item?.id) return false;
+  const queue = readProfileQueue();
+  if (queue.some((entry) => entry.id === item.id)) return false;
+  writeProfileQueue([...queue, { id: item.id, statement: item.statement ?? '', dimension: item.dimension ?? '' }]);
+  return true;
+}
+
 export function commitProfileMerge(ids) {
   const done = new Set(ids);
   writeProfileQueue(readProfileQueue().filter((item) => !done.has(item.id)));
@@ -1531,14 +1546,22 @@ async function runClassifyStep() {
   let rules = 0;
   let profiles = 0;
   let pending = 0;
-  const known = new Set(batch.map((item) => item.id));
+  const known = new Map(batch.map((item) => [item.id, item]));
   for (const item of classified) {
     if (!known.has(item.id)) continue;
     if (item.kind === 'rule' && item.trigger) {
       soul.markRule(item.id, { trigger: item.trigger, action: item.action });
       rules += 1;
     } else if (item.kind === 'profile') {
-      soul.markProfile(item.id);
+      soul.markProfile(item.id, { dimension: item.dimension });
+      // The classification is the only moment the dimension is known, so the merge
+      // queue is fed here. Without this the merge stage had no live input at all and
+      // only ever ran from a hand-seeded queue.
+      enqueueProfileCandidate({
+        id: item.id,
+        statement: known.get(item.id).statement,
+        dimension: item.dimension ?? '',
+      });
       profiles += 1;
     } else {
       // Neither bucket is safe for an unclassifiable lesson: a rule would fire
