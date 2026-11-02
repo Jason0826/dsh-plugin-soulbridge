@@ -486,7 +486,18 @@ export function createPreStepHandler(deps) {
     if (handedOff.has(sessionId)) return '';
     handedOff.add(sessionId);
     try {
-      return renderHandoff(ensureSoul().lastClosedThread(), sessionId);
+      const last = ensureSoul().lastClosedThread();
+      const block = renderHandoff(last, sessionId);
+      if (block) {
+        log(`handoff: "${last.thread.topic}" summary=${last.conclusion ? 'yes' : 'no'}`);
+        trace({
+          event: 'handoff',
+          thread: last.thread.id,
+          theme: last.thread.topic,
+          hasSummary: Boolean(last.conclusion),
+        });
+      }
+      return block;
     } catch (error) {
       log(`handoff failed: ${error instanceof Error ? error.message : String(error)}`);
       return '';
@@ -513,10 +524,12 @@ export function createPreStepHandler(deps) {
         log('prestep: inject disabled by config');
         return decision;
       }
-      // Topics the conversation has moved past, closed once per turn. Pure
-      // arithmetic on turn numbers — no model, so it cannot fail softly.
+      // Topics the conversation has moved past, closed once per turn. Counting
+      // actual turns — the host's turn numbers jump by 10–30 per exchange, so a
+      // numeric difference closed a topic one message after it opened.
+      const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
       try {
-        const closed = ensureSoul().closeIdleThreads(Number(payload?.turn ?? 0), readConfig().threadIdleTurns ?? 6, Date.now());
+        const closed = ensureSoul().closeIdleThreads(sessionId, readConfig().threadIdleTurns ?? 6, Date.now());
         if (closed.length > 0) {
           log(`threads closed: ${closed.join(',')}`);
           // A closed thread is the unit consolidation runs on — never a batch of
@@ -530,7 +543,6 @@ export function createPreStepHandler(deps) {
       const text = textOf(messages[messages.length - 1]?.content);
       if (text.length === 0) return decision;
 
-      const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
       const turn = payload?.turn;
       if (injectedTurn.get(sessionId) === turn) return decision;
 
@@ -702,17 +714,24 @@ async function runExtraction(text, turnId, turnNo) {
   try {
     const useLlm = config.extract === 'llm' && Boolean(injectedLlm);
     const soul = ensureSoul();
+    const turnRow = soul.turn(turnId);
+    const context = soul.extractionContext(20, { turnNo });
+    // "The previous turn belonged to this thread" is the cheapest continuity hint
+    // there is: in most cases the answer is simply "the same one again".
+    if (turnRow) {
+      const previousThreadId = soul.threadBefore(turnRow.sessionId, turnNo);
+      if (previousThreadId) context.previousThreadId = previousThreadId;
+    }
     const draft = await soul.extract(text, {
       llm: useLlm ? injectedLlm : undefined,
       mode: useLlm ? 'auto' : 'rules',
       // The extractor needs the open threads so it can say which one this turn
       // continues, and how long ago each was last seen.
-      context: soul.extractionContext(20, { turnNo }),
+      context,
     });
     const result = soul.commitDrafts(draft, { turnId });
     // Attribution is written even when nothing was extracted: a turn that says
     // "无" (nothing worth remembering) can still be part of a thread.
-    const turnRow = soul.turn(turnId);
     const attribution = soul.applyThread(draft.thread, {
       sessionId: turnRow?.sessionId ?? 'unknown',
       turnNo,
