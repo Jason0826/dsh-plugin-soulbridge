@@ -13,7 +13,8 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   openSqlite,
   ensureConfig,
@@ -29,6 +30,7 @@ import {
   normalizeStatement,
   parseConclusionDraft,
   parseVerificationDraft,
+  readVerification,
 } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
@@ -577,10 +579,12 @@ export function createPreStepHandler(deps) {
    */
   function takeHandoff(sessionId) {
     if (handedOff.has(sessionId)) return '';
-    handedOff.add(sessionId);
     try {
       const last = ensureSoul().lastClosedThread();
       const block = renderHandoff(last, sessionId);
+      // Only mark it once the read succeeded: a transient failure on the first turn
+      // used to exclude the session from handoff forever.
+      handedOff.add(sessionId);
       if (block) {
         log(`handoff: "${last.thread.topic}" summary=${last.conclusion ? 'yes' : 'no'}`);
         trace({
@@ -592,7 +596,7 @@ export function createPreStepHandler(deps) {
       }
       return block;
     } catch (error) {
-      log(`handoff failed: ${error instanceof Error ? error.message : String(error)}`);
+      log(`handoff failed (will retry next turn): ${error instanceof Error ? error.message : String(error)}`);
       return '';
     }
   }
@@ -604,13 +608,24 @@ export function createPreStepHandler(deps) {
       // We are inside a live turn now, which is the only place the host model is
       // callable. Stages run in priority order and a stage that skipped its work
       // must not claim the call — that is how the classifier starved for an hour.
-      void (async () => {
-        try {
-          await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep]);
-        } catch (error) {
-          log(`background: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      })();
+      //
+      // Single flight: the handler returns before the chain finishes, so without
+      // this guard a slow stage lets the next pre-step start a second chain and two
+      // model calls overlap in one step (live log showed two verify calls in flight).
+      if (stageChainBusy) {
+        log('background: chain still running, skipping this step');
+      } else {
+        stageChainBusy = true;
+        void (async () => {
+          try {
+            await runStageChain([drainExtractionQueue, runConsolidationStep, runClassifyStep]);
+          } catch (error) {
+            log(`background: ${error instanceof Error ? error.message : String(error)}`);
+          } finally {
+            stageChainBusy = false;
+          }
+        })();
+      }
       // Control switch for the A/B test: plugin-config.json { "injectEnabled": false }
       if (readConfig().injectEnabled === false) {
         log('prestep: inject disabled by config');
@@ -648,7 +663,9 @@ export function createPreStepHandler(deps) {
       if (text.length === 0) return decision;
 
       const turn = payload?.turn;
-      if (injectedTurn.get(sessionId) === turn) return decision;
+      // A non-finite turn cannot identify a step; injecting once per undefined turn
+      // would compare undefined === undefined and skip every pre-step silently.
+      if (turn !== undefined && injectedTurn.get(sessionId) === turn) return decision;
 
       const ctx = deps.getContext(text);
       const related = typeof ctx === 'string' ? ctx : (ctx?.text ?? '');
@@ -773,17 +790,50 @@ function readExtractQueue() {
   try {
     const raw = JSON.parse(readFileSync(EXTRACT_QUEUE_FILE, 'utf8'));
     return Array.isArray(raw) ? raw : [];
-  } catch {
+  } catch (error) {
+    // An unreadable queue must not look like an empty one: that silently erases the
+    // backlog on the next write.
+    if (existsSync(EXTRACT_QUEUE_FILE)) {
+      log(`extract queue unreadable, setting it aside: ${error instanceof Error ? error.message : String(error)}`);
+      try {
+        renameSync(EXTRACT_QUEUE_FILE, `${EXTRACT_QUEUE_FILE}.corrupt-${Date.now()}`);
+      } catch {
+        /* the log above is the record */
+      }
+    }
     return [];
   }
 }
 
 function writeExtractQueue(queue) {
   try {
-    writeFileSync(EXTRACT_QUEUE_FILE, JSON.stringify(queue.slice(0, 50), null, 2), 'utf8');
+    // Keep the newest when over the cap — the old code kept the oldest and dropped
+    // exactly the turns that had just been added.
+    const kept = queue.length > 50 ? queue.slice(queue.length - 50) : queue;
+    if (kept.length < queue.length) log(`extract queue: dropped ${queue.length - kept.length} oldest items`);
+    writeFileSync(EXTRACT_QUEUE_FILE, JSON.stringify(kept, null, 2), 'utf8');
   } catch (error) {
     log(`extract queue write failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/**
+ * Remove one item by identity, computed from a fresh read.
+ *
+ * The drain used to write a `rest` array captured before its model call, so a turn
+ * enqueued during that call (turn/end arrives while extraction is still running) was
+ * overwritten and lost.
+ */
+function removeExtractItem(turnId) {
+  writeExtractQueue(readExtractQueue().filter((item) => item.turnId !== turnId));
+}
+
+function bumpExtractAttempt(turnId) {
+  writeExtractQueue(
+    readExtractQueue().map((item) =>
+      item.turnId === turnId ? { ...item, attempts: (item.attempts ?? 0) + 1 } : item,
+    ),
+  );
 }
 
 function enqueueExtraction(turnId, turnNo) {
@@ -876,6 +926,8 @@ async function runExtraction(text, turnId, turnNo) {
 }
 
 let draining = false;
+/** True while a stage chain is running, so two chains never overlap. */
+let stageChainBusy = false;
 
 /**
  * Drain the extraction queue inside a live turn.
@@ -904,7 +956,7 @@ export async function drainExtractionQueue() {
   if (queue.length === 0) return;
   draining = true;
   try {
-    const [item, ...rest] = queue;
+    const item = queue[0];
     let text = '';
     try {
       const turn = ensureSoul().turn(item.turnId);
@@ -914,7 +966,7 @@ export async function drainExtractionQueue() {
     }
     if (!text) {
       log(`extract queue: turn ${item.turnId} missing, dropped`);
-      writeExtractQueue(rest);
+      removeExtractItem(item.turnId);
       return;
     }
 
@@ -922,8 +974,8 @@ export async function drainExtractionQueue() {
     const ok =
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
-      writeExtractQueue(rest);
-      trace({ event: 'extract-queue', drained: 1, remaining: rest.length, outcome });
+      removeExtractItem(item.turnId);
+      trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome });
       return true;
     }
 
@@ -931,12 +983,14 @@ export async function drainExtractionQueue() {
     const attempts = (item.attempts ?? 0) + 1;
     if (attempts >= EXTRACT_MAX_ATTEMPTS) {
       log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
-      writeExtractQueue(rest);
+      removeExtractItem(item.turnId);
       return true;
     }
     log(`extract queue: retry turn=${item.turnNo} attempt=${attempts} (${outcome})`);
-    writeExtractQueue([{ ...item, attempts }, ...rest]);
-    trace({ event: 'extract-queue', drained: 1, remaining: rest.length + 1, outcome, retry: true });
+    // Bump in place, computed from a fresh read: an item enqueued during the model
+    // call must not be overwritten by a stale queue snapshot.
+    bumpExtractAttempt(item.turnId);
+    trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome, retry: true });
     return true;
   } finally {
     draining = false;
@@ -994,6 +1048,59 @@ function shiftConsolidationQueue() {
   return first;
 }
 
+/**
+ * How many times a thread has been put back without producing a result.
+ *
+ * A thread whose facts have not arrived yet must be retried, not discarded; the
+ * counter is what stops a permanently unsuitable thread from cycling forever.
+ */
+const CONSOLIDATION_ATTEMPTS_FILE = join(HOME, 'consolidation-attempts.json');
+
+function readConsolidationAttempts() {
+  try {
+    const raw = JSON.parse(readFileSync(CONSOLIDATION_ATTEMPTS_FILE, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function bumpConsolidationAttempt(threadId) {
+  const attempts = readConsolidationAttempts();
+  const next = Number(attempts[threadId] ?? 0) + 1;
+  attempts[threadId] = next;
+  try {
+    writeFileSync(CONSOLIDATION_ATTEMPTS_FILE, JSON.stringify(attempts, null, 2), 'utf8');
+  } catch (error) {
+    log(`consolidate attempts write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return next;
+}
+
+function clearConsolidationAttempt(threadId) {
+  const attempts = readConsolidationAttempts();
+  if (!(threadId in attempts)) return;
+  delete attempts[threadId];
+  try {
+    writeFileSync(CONSOLIDATION_ATTEMPTS_FILE, JSON.stringify(attempts, null, 2), 'utf8');
+  } catch {
+    /* the counter is an optimisation, not a record */
+  }
+}
+
+/** Put a thread back at the tail, or give up loudly once it has had enough tries. */
+function deferConsolidationThread(threadId, why) {
+  const attempts = bumpConsolidationAttempt(threadId);
+  if (attempts >= 3) {
+    clearConsolidationAttempt(threadId);
+    log(`consolidate: giving up on thread ${threadId} after ${attempts} attempts (${why})`);
+    trace({ event: 'consolidate', verdict: 'abandoned', thread: threadId, reason: why, attempts });
+    return;
+  }
+  enqueueConsolidation([threadId]);
+  log(`consolidate: thread ${threadId} deferred after ${attempts} attempt(s) (${why})`);
+}
+
 function writeConsolidationState(state) {
   try {
     writeFileSync(CONSOLIDATION_FILE, JSON.stringify(state, null, 2), 'utf8');
@@ -1022,9 +1129,29 @@ function finishConclusion(soul, draft, { threadId, batch, relation }) {
     result = soul.recordConclusion(effective, { allowed });
   }
   const summaryId = result.merged ?? result.fact?.id;
+  if (!result.ok) {
+    // The gate refused it (too few citations, evidence outside the batch, length,
+    // over-generalisation). Before this it logged "consolidate ok written=false",
+    // cleared pending, and left the thread closed with no summary and no retry.
+    log(`consolidate rejected: ${result.reason ?? 'gate'} — "${draft.statement}"`);
+    trace({
+      event: 'consolidate',
+      verdict: 'rejected',
+      ok: false,
+      reason: result.reason,
+      relation: relation.kind,
+      target: relation.target ?? null,
+      statement: draft.statement,
+      thread: threadId,
+    });
+    if (threadId) deferConsolidationThread(threadId, `gate:${result.reason ?? 'unknown'}`);
+    writeConsolidationState({ pending: null });
+    return;
+  }
+  if (threadId) clearConsolidationAttempt(threadId);
   // The conclusion becomes the thread's summary; a closed thread with no summary
   // is still closed, it just has nothing to remember it by.
-  if (result.ok && threadId && summaryId) soul.store.closeThread(threadId, Date.now(), summaryId);
+  if (threadId && summaryId) soul.store.closeThread(threadId, Date.now(), summaryId);
   log(
     `consolidate ok: thread=${threadId ?? '-'} relation=${relation.kind} "${draft.statement}" ` +
       `evidence=${draft.evidence.length} written=${Boolean(result.fact)} merged=${result.merged ?? '-'} ` +
@@ -1067,12 +1194,39 @@ function writeClassifyQueue(queue) {
   }
 }
 
-function shiftClassifyBatch() {
-  const queue = readClassifyQueue();
-  if (queue.length === 0) return [];
-  const batch = queue.slice(0, CLASSIFY_BATCH);
-  writeClassifyQueue(queue.slice(batch.length));
-  return batch;
+export function peekClassifyBatch() {
+  return readClassifyQueue().slice(0, CLASSIFY_BATCH);
+}
+
+/** Remove items only after their result has been applied. */
+export function commitClassifyBatch(ids) {
+  const done = new Set(ids);
+  writeClassifyQueue(readClassifyQueue().filter((item) => !done.has(item.id)));
+}
+
+/**
+ * Put a failed batch back with one more attempt.
+ *
+ * A batch used to be removed before the model call, so a throw or an empty reply
+ * lost up to ten lessons with only a generic background error to show for it.
+ */
+export function retryClassifyBatch(batch) {
+  const retry = new Map(batch.map((item) => [item.id, item]));
+  const out = [];
+  for (const item of readClassifyQueue()) {
+    if (!retry.has(item.id)) {
+      out.push(item);
+      continue;
+    }
+    const attempts = (item.attempts ?? 0) + 1;
+    if (attempts >= 3) {
+      log(`classify: giving up ${item.id} after ${attempts} attempts`);
+      trace({ event: 'classify-abandoned', id: item.id, attempts });
+      continue;
+    }
+    out.push({ ...item, attempts });
+  }
+  writeClassifyQueue(out);
 }
 
 /**
@@ -1084,10 +1238,25 @@ function shiftClassifyBatch() {
 async function runClassifyStep() {
   const config = readConfig();
   if (config.extract === 'off' || !injectedLlm) return false;
-  const batch = shiftClassifyBatch();
+  const batch = peekClassifyBatch();
   if (batch.length === 0) return false;
-  const raw = await injectedLlm(renderRuleClassifyPrompt({ items: batch }));
+
+  let raw;
+  try {
+    raw = await injectedLlm(renderRuleClassifyPrompt({ items: batch }));
+  } catch (error) {
+    log(`classify: call failed (${error instanceof Error ? error.message : String(error)}) — retrying batch`);
+    retryClassifyBatch(batch);
+    return true;
+  }
   const classified = parseRuleClassifications(raw);
+  if (classified.length === 0) {
+    // An empty or unreadable reply is not a classification: keep the lessons.
+    log('classify: empty or unparseable reply — retrying batch');
+    retryClassifyBatch(batch);
+    return true;
+  }
+
   const soul = ensureSoul();
   let rules = 0;
   let profiles = 0;
@@ -1108,6 +1277,7 @@ async function runClassifyStep() {
       pending += 1;
     }
   }
+  commitClassifyBatch(batch.map((item) => item.id));
   log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}`);
   trace({ event: 'classify', batch: batch.length, rules, profiles, pending });
   return true;
@@ -1134,8 +1304,23 @@ async function runConsolidationStep() {
 
   if (state.pending?.phase === 'verify') {
     const { draft, batch, threadId } = state.pending;
-    const raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
-    const verdict = parseVerificationDraft(raw) ?? { verdict: 'unsupported', reason: 'unparseable verdict' };
+    let raw;
+    try {
+      raw = await injectedLlm(renderVerificationPrompt({ conclusion: draft.statement, facts: batch }));
+    } catch (error) {
+      // The draft is still pending; the next step retries the check.
+      log(`consolidate verify failed: ${error instanceof Error ? error.message : String(error)} — retrying`);
+      return true;
+    }
+    const checked = readVerification(raw);
+    if (checked.kind === 'retry') {
+      // An empty or unreadable reply is not evidence against the conclusion. Before
+      // this, it was coerced to "unsupported" and the draft was dropped unchecked.
+      log(`consolidate verify retry: ${checked.reason} — "${draft.statement}"`);
+      trace({ event: 'consolidate', verdict: 'verify-retry', reason: checked.reason, thread: threadId });
+      return true;
+    }
+    const verdict = checked.verdict;
     if (verdict.verdict === 'supported') {
       // Supported, but not yet written: first ask whether we already hold it.
       // The check runs in its own step so this step keeps to one model call.
@@ -1192,16 +1377,19 @@ async function runConsolidationStep() {
   if (!threadId) return false;
   const context = soul.threadContext(threadId);
   if (!context) {
-    // A skip is not a model call: returning true here starved the classifier, which
-    // only runs when nothing else needed the one call per step.
-    log(`consolidate: thread ${threadId} missing, skipped`);
+    // Missing is permanent: the thread row is gone, not waiting for facts.
+    clearConsolidationAttempt(threadId);
+    log(`consolidate: thread ${threadId} missing, dropped`);
+    trace({ event: 'consolidate', verdict: 'missing-thread', thread: threadId });
     return false;
   }
-  // Two citations are the floor for a conclusion; a thread with fewer facts is
-  // recorded as "not yet", not forced into a judgement.
+  // A thread can be closed while some of its turns are still waiting in the
+  // extraction queue, so "few facts now" does not mean "few facts ever". It was
+  // discarded here before; now it goes back to the tail with an attempt counter.
   if (context.facts.length < 2) {
-    log(`consolidate skipped: thread ${threadId} has ${context.facts.length} fact(s)`);
+    log(`consolidate deferred: thread ${threadId} has ${context.facts.length} fact(s)`);
     trace({ event: 'consolidate', verdict: 'too-few-facts', thread: threadId, facts: context.facts.length });
+    deferConsolidationThread(threadId, 'too-few-facts');
     return false;
   }
 
@@ -1210,19 +1398,26 @@ async function runConsolidationStep() {
     statement: fact.statement,
     atText: fact.atText,
   }));
-  const raw = await injectedLlm(
-    renderConsolidationPrompt({
-      facts: batch,
-      existing: soul.conclusions(5).map((fact) => ({ id: fact.id, statement: fact.statement })),
-      thread: {
-        topic: context.thread.topic,
-        turns: context.turns.map((turn) => {
-          const answer = turn.assistantText.replace(/\s+/g, ' ').slice(0, 120);
-          return `用户：${turn.userText.slice(0, 160)}${answer ? ` / 我：${answer}` : ''}`;
-        }),
-      },
-    }),
-  );
+  let raw;
+  try {
+    raw = await injectedLlm(
+      renderConsolidationPrompt({
+        facts: batch,
+        existing: soul.conclusions(5).map((fact) => ({ id: fact.id, statement: fact.statement })),
+        thread: {
+          topic: context.thread.topic,
+          turns: context.turns.map((turn) => {
+            const answer = turn.assistantText.replace(/\s+/g, ' ').slice(0, 120);
+            return `用户：${turn.userText.slice(0, 160)}${answer ? ` / 我：${answer}` : ''}`;
+          }),
+        },
+      }),
+    );
+  } catch (error) {
+    log(`consolidate draft failed: ${error instanceof Error ? error.message : String(error)} — deferring thread`);
+    deferConsolidationThread(threadId, 'draft-call-failed');
+    return true;
+  }
   const draft = parseConclusionDraft(raw);
   if (!draft) {
     log(`consolidate: nothing to conclude from thread ${threadId} (${batch.length} facts)`);
