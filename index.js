@@ -1340,10 +1340,23 @@ async function runProfileStep() {
     retryProfileMerge(batch);
     return true;
   }
-  const written = ensureSoul().applyProfileMerge(lines);
+  const soul = ensureSoul();
+  const written = soul.applyProfileMerge(lines);
+  // A merge is supposed to cover its whole input. Lines the model did not cite used
+  // to stay active forever, so the profile grew a stale tail nobody saw.
+  const covered = new Set(lines.flatMap((line) => line.sources));
+  const leftovers = batch.map((item) => item.id).filter((id) => !covered.has(id));
+  const successor = written[0]?.id;
+  for (const id of leftovers) {
+    const fact = soul.store.fact(id);
+    if (fact && fact.status !== 'superseded' && successor) soul.store.supersedeFact(id, successor);
+  }
   commitProfileMerge(batch.map((item) => item.id));
-  log(`profile merged: sources=${batch.length} lines=${written.length}`);
-  trace({ event: 'profile', sources: batch.length, lines: written.length });
+  log(
+    `profile merged: sources=${batch.length} lines=${written.length}` +
+      ` covered=${covered.size} retired=${leftovers.length}`,
+  );
+  trace({ event: 'profile', sources: batch.length, lines: written.length, retired: leftovers.length });
   return true;
 }
 /* ------------------------------------------------------------------ *
