@@ -1106,6 +1106,9 @@ export async function drainExtractionQueue() {
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
       removeExtractItem(item.turnId);
+      // Promotion is decided after the facts exist: a corrected turn's lessons enter
+      // the classification queue here, which is the only live producer it has.
+      feedClassifyFromTurn(item.turnId);
       trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome });
       return true;
     }
@@ -1515,6 +1518,48 @@ export function retryClassifyBatch(batch) {
 }
 
 /**
+ * Put one lesson in the classification queue.
+ *
+ * The reason travels with it so the queue is explainable: "why was this promoted"
+ * must be answerable from the queue file, not reconstructed from the log.
+ */
+export function enqueueClassifyCandidate(item) {
+  if (!item?.id) return false;
+  const queue = readClassifyQueue();
+  if (queue.some((entry) => entry.id === item.id)) return false;
+  writeClassifyQueue([
+    ...queue,
+    { id: item.id, statement: item.statement ?? '', reason: item.reason ?? 'unknown' },
+  ]);
+  return true;
+}
+
+/**
+ * T1 (brief 0023): a corrected turn's lessons are promoted, and nothing else is.
+ *
+ * Being told you were wrong is the consequence an experience comes with, which is
+ * the one promotion signal we can trust without a threshold. Everything else waits.
+ */
+export function feedClassifyFromTurn(turnId) {
+  try {
+    const soul = ensureSoul();
+    if (!soul.wasCorrectedTurn(turnId)) return 0;
+    let added = 0;
+    for (const fact of soul.promotionCandidates(turnId)) {
+      if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: 'T1-修正' })) {
+        added += 1;
+      }
+    }
+    if (added > 0) log(`promote: T1 corrected turn → ${added} candidate(s) queued for classification`);
+    trace({ event: 'promote', rule: 'T1', turn: turnId, queued: added });
+    return added;
+  } catch (error) {
+    log(`promote: failed (${error instanceof Error ? error.message : String(error)})`);
+    return 0;
+  }
+}
+
+/**
  * One classification batch per quiet step.
  *
  * Returns true when a model call was made, mirroring the extraction contract so the
@@ -1571,8 +1616,16 @@ async function runClassifyStep() {
     }
   }
   commitClassifyBatch(batch.map((item) => item.id));
-  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}`);
-  trace({ event: 'classify', batch: batch.length, rules, profiles, pending });
+  // "Promoted because of what" is a number, not a memory: the brief's acceptance
+  // metric is the reason split, and it can only be counted if it is logged.
+  const reasons = {};
+  for (const item of batch) {
+    const reason = item.reason ?? 'seed';
+    reasons[reason] = (reasons[reason] ?? 0) + 1;
+  }
+  const reasonText = Object.entries(reasons).map(([reason, n]) => `${reason}:${n}`).join(',');
+  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending} reasons=${reasonText}`);
+  trace({ event: 'classify', batch: batch.length, rules, profiles, pending, reasons });
   return true;
 }
 /**
