@@ -467,7 +467,9 @@ function buildRelatedContext(text) {
   }
   if (policy.timeline && plan?.subject) {
     try {
-      const timeline = ensureSoul().latestAbout(plan.subject, { limit: 3 });
+      // The question, not just the subject: an entity with many facts must return
+      // the ones this question is about, not its three most recent.
+      const timeline = ensureSoul().latestAbout(plan.subject, { query: text, limit: 3 });
       if (timeline.length > 0) {
         const body = timeline
           .map((fact) => `- [${fact.id}] ${fact.atText ? `${fact.atText} ` : ''}${fact.statement}`)
