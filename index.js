@@ -1101,11 +1101,16 @@ async function runExtraction(text, turnId, turnNo) {
     const ms = Date.now() - started;
     log(
       `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
-        ` gaps=${result.gaps.length} skipped=${result.skipped.length} ms=${ms} turn=${turnNo}` +
+        ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
+        ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
+        ` ms=${ms} turn=${turnNo}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
+    }
+    for (const slot of result.droppedSlots.slice(0, 3)) {
+      log(`  extract slot kept as text: ${slot.slot}=${slot.value} (undeclared)`);
     }
     trace({
       event: 'extract',
@@ -1116,6 +1121,8 @@ async function runExtraction(text, turnId, turnNo) {
       facts: result.facts.length,
       gaps: result.gaps.length,
       skipped: result.skipped,
+      droppedSlots: result.droppedSlots,
+      holderFallbacks: result.holderFallbacks,
       thread: attribution.threadId,
       threadCreated: attribution.created,
       threadTopic: attribution.topic,
