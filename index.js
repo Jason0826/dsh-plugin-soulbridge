@@ -1139,7 +1139,8 @@ async function runExtraction(text, turnId, turnNo) {
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` ms=${ms} turn=${turnNo}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
-        ` join=${attribution.joinReason}`,
+        ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
+        `${attribution.topicUpdated ? ' topic=updated' : ''}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -1161,6 +1162,8 @@ async function runExtraction(text, turnId, turnNo) {
       thread: attribution.threadId,
       threadCreated: attribution.created,
       threadTopic: attribution.topic,
+      threadLine: draft.threadLine ?? null,
+      topicUpdated: attribution.topicUpdated,
       joinReason: attribution.joinReason,
       ms,
     });
