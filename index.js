@@ -806,9 +806,17 @@ export function createPreStepHandler(deps) {
             // "Pending" means a dimension group has at least two judgments in it: a
             // queue of singletons has nothing to collapse and must not hold a slot.
             const profilePending = hasMergeableGroup(peekProfileQueue());
-            const stages = [drainExtractionQueue];
+            const stages = [];
+            const extractQueue = readExtractQueue();
+            const consolidationPending = readConsolidationQueue().length > 0;
+            // Live conversation before everything; understanding before the backfill.
+            // Fixed priority (extract always first) plus a long backfill is a starvation
+            // bug, not a preference: 29 closed threads waited while the backfill drained.
+            if (extractRunsFirst(extractQueue, consolidationPending)) stages.push(drainExtractionQueue);
+            stages.push(runConsolidationStep);
+            stages.push(drainExtractionQueue);
             if (profilePending && stageTick % 2 === 0) stages.push(runProfileStep);
-            stages.push(runConsolidationStep, runClassifyStep);
+            stages.push(runClassifyStep);
             if (profilePending && stageTick % 2 === 1) stages.push(runProfileStep);
             stageTick += 1;
             // The timeout has to be cancelled when the chain wins the race. Left
@@ -1197,12 +1205,30 @@ let stageChainBusy = false;
 let stageTick = 0;
 
 /**
- * Drain the extraction queue inside a live turn.
+ * Which queued turn to extract next.
  *
- * The host model is only callable while a turn is running, so the queue exists:
- * turns are written at the end of one and extracted at the start of the next.
- * A failure keeps the item for a retry; three failures drop it with the reason.
+ * Live turns first, then history: FIFO alone would put 20 backfill items ahead of the
+ * conversation happening right now, so a live turn waits dozens of steps to be read.
  */
+export function pickExtractionItem(queue) {
+  // Live turns first, then history. FIFO alone would put 20 backfill items ahead of the
+  // conversation happening right now, so a live turn waits dozens of steps to be read.
+  return queue.find((item) => (item.origin ?? 'live') !== 'backfill') ?? queue[0] ?? null;
+}
+
+/**
+ * Should extraction take this step before consolidation?
+ *
+ * A backfill backlog used to keep extraction busy every step, and because a stage that
+ * did work ends the chain, consolidation never got a turn: measured 29 threads queued,
+ * 0 consolidated while the backfill drained. Live conversation still goes first;
+ * when only history is waiting, understanding goes first and the backfill waits.
+ */
+export function extractRunsFirst(extractQueue, consolidationPending) {
+  const hasLive = extractQueue.some((item) => (item.origin ?? 'live') !== 'backfill');
+  return hasLive || !consolidationPending;
+}
+
 /**
  * Drain ONE queued turn per step.
  *
@@ -1216,14 +1242,14 @@ let stageTick = 0;
  * drop it with the reason.
  */
 export async function drainExtractionQueue() {
-  if (draining) return;
+  if (draining) return false;
   const config = readConfig();
-  if (config.extract === 'off') return;
+  if (config.extract === 'off') return false;
   const queue = readExtractQueue();
-  if (queue.length === 0) return;
+  if (queue.length === 0) return false;
   draining = true;
   try {
-    const item = queue[0];
+    const item = pickExtractionItem(queue);
     let text = '';
     try {
       const turn = ensureSoul().turn(item.turnId);
