@@ -1088,7 +1088,10 @@ async function runExtraction(text, turnId, turnNo) {
     const useLlm = config.extract === 'llm' && Boolean(injectedLlm);
     const soul = ensureSoul();
     const turnRow = soul.turn(turnId);
-    const context = soul.extractionContext(20, { turnNo });
+    // The context carries both halves of continuity (ADR 0034): the candidates' last
+    // lines, and the previous user line — extraction is per turn, so without it the
+    // model cannot tell "继续" from a new subject.
+    const context = soul.extractionContext(20, { turnNo, sessionId: turnRow?.sessionId });
     // "The previous turn belonged to this thread" is the cheapest continuity hint
     // there is: in most cases the answer is simply "the same one again".
     if (turnRow) {
@@ -1111,6 +1114,7 @@ async function runExtraction(text, turnId, turnNo) {
       turnId,
       at: Date.now(),
       fallbackTopic: text.slice(0, 20),
+      previousThreadId: context.previousThreadId,
     });
     const ms = Date.now() - started;
     log(
@@ -1118,7 +1122,8 @@ async function runExtraction(text, turnId, turnNo) {
         ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` ms=${ms} turn=${turnNo}` +
-        ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}`,
+        ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
+        ` join=${attribution.joinReason}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -1140,6 +1145,7 @@ async function runExtraction(text, turnId, turnNo) {
       thread: attribution.threadId,
       threadCreated: attribution.created,
       threadTopic: attribution.topic,
+      joinReason: attribution.joinReason,
       ms,
     });
     // Rules mode is a deliberate configuration, not a failed model call.
