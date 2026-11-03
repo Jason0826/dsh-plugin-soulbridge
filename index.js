@@ -13,7 +13,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   openSqlite,
@@ -1012,7 +1012,12 @@ function readQueueFile(file) {
 function writeQueueFile(file, queue, { cap, keep = 'oldest' } = {}) {
   try {
     const kept = !cap || queue.length <= cap ? queue : keep === 'newest' ? queue.slice(queue.length - cap) : queue.slice(0, cap);
-    if (kept.length < queue.length) log(`queue over cap (${file}): dropped ${queue.length - kept.length}`);
+    const dropped = queue.length - kept.length;
+    // A cap drop is data loss. It used to be logged only when it happened, which is
+    // exactly when nobody was reading; a backlog also logs its size so a batch that
+    // never drains is visible instead of being inferred from an empty file later.
+    if (dropped > 0) log(`queue over cap (${basename(file)}): wrote ${kept.length}, dropped ${dropped}`);
+    else if (queue.length >= 10) log(`queue backlog (${basename(file)}): ${queue.length}`);
     writeFileSync(file, JSON.stringify(kept, null, 2), 'utf8');
   } catch (error) {
     log(`queue write failed (${file}): ${error instanceof Error ? error.message : String(error)}`);
@@ -1041,12 +1046,21 @@ function bumpExtractAttempt(turnId) {
   );
 }
 
-function enqueueExtraction(turnId, turnNo) {
+/**
+ * Add one turn to the extraction queue.
+ *
+ * Exported so a script can batch-requeue history through the same writer: the last
+ * attempt wrote the file from a separate script and the batch vanished unobserved
+ * (capped at 50 by the writer it bypassed, with no line saying so). One writer, one
+ * cap, one log line.
+ */
+export function enqueueExtraction(turnId, turnNo) {
   const queue = readExtractQueue();
-  if (queue.some((item) => item.turnId === turnId)) return;
+  if (queue.some((item) => item.turnId === turnId)) return false;
   queue.push({ turnId, turnNo, attempts: 0 });
   writeExtractQueue(queue);
-  log(`extract queued turn=${turnNo} pending=${queue.length}`);
+  log(`extract queued turn=${turnNo} pending=${queue.length} file=${EXTRACT_QUEUE_FILE}`);
+  return true;
 }
 
 /**

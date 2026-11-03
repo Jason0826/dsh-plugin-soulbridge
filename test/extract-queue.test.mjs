@@ -1,0 +1,50 @@
+/**
+ * The extraction queue has one writer, a cap, and says how much the cap dropped.
+ *
+ * A batch of 108 turns once vanished without a trace: it was written from outside this
+ * writer, so up to 58 were capped away and nothing recorded it. These tests pin the
+ * contract that makes any future loss visible: dedupe by turn id, cap keeps the newest,
+ * and the file is exactly what the writer reported.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const home = mkdtempSync(join(tmpdir(), 'soulbridge-extract-queue-'));
+process.env.SOULBRIDGE_HOME = home;
+const mod = await import(`../index.js?extract-queue=${Date.now()}`);
+
+const queueFile = join(home, 'pending-extract.json');
+const readQueue = () => JSON.parse(readFileSync(queueFile, 'utf8'));
+
+test('extract queue: enqueue adds one item and reports whether it was new', () => {
+  assert.equal(mod.enqueueExtraction('t1', 1), true);
+  assert.equal(mod.enqueueExtraction('t2', 2), true);
+  assert.equal(mod.enqueueExtraction('t1', 1), false, '同一轮不重复入队');
+  assert.equal(readQueue().length, 2);
+  assert.deepEqual(
+    readQueue().map((item) => item.turnId),
+    ['t1', 't2'],
+  );
+});
+
+test('extract queue: the cap keeps the newest work', () => {
+  writeFileSync(queueFile, '[]', 'utf8');
+  for (let i = 0; i < 60; i += 1) mod.enqueueExtraction(`cap-${i}`, i);
+  const queue = readQueue();
+  // Keep-newest is deliberate: the turns just added are the ones still in the user's
+  // head, and the old implementation kept the oldest and dropped those instead.
+  assert.equal(queue.length, 50);
+  assert.equal(queue[0].turnId, 'cap-10', '前 10 条被丢弃，保留最新的 50');
+  assert.equal(queue.at(-1).turnId, 'cap-59');
+});
+
+test.after(() => {
+  try {
+    rmSync(home, { recursive: true, force: true });
+  } catch {
+    /* Windows keeps SQLite handles open */
+  }
+});
