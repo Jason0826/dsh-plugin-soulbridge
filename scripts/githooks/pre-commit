@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse commits that contain the damage a shell replace leaves behind.
+# Installed by `node scripts/install-hooks.mjs` (which sets core.hooksPath).
+exec node "$(dirname "$0")/../../scripts/check-diff-artifacts.mjs"
