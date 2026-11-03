@@ -317,6 +317,19 @@ function ensureSoul() {
 /** Last system-prompt text hash, so a changed section is visible in the trace. */
 let lastSectionHash = '';
 
+/**
+ * The first whole sentence, used when the model gave no topic for a new thread.
+ *
+ * A character prefix cuts mid-clause ("这件事我们应该先" + cut), while a sentence is a
+ * complete unit — the same unit-level rule the rest of the prompt evidence follows.
+ */
+export function firstSentence(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return '';
+  const match = /^[\s\S]*?[。！？!?\n]/.exec(trimmed);
+  return (match ? match[0] : trimmed).trim();
+}
+
 /** FNV-1a: short, dependency-free, good enough to detect change. */
 function hashText(text) {
   let hash = 0x811c9dc5;
@@ -686,10 +699,13 @@ export function renderHandoff(last, sessionId) {
   const when = new Date(last.thread.closedAt ?? Date.now()).toISOString().slice(0, 10);
   // Topic and turn text are user words: escape them, or a pasted `</handoff>` ends
   // the block and everything after it reads as ordinary conversation.
-  const lines = [`<handoff topic="${escapeAttr(last.thread.topic.slice(0, 30))}" closed="${when}">`];
+  // Whole lines, never prefixes: the handoff exists so the model knows what was said,
+  // and a cut line can drop the clause that made it matter. Size is bounded by how
+  // many turns the caller carries, not by cutting each one.
+  const lines = [`<handoff topic="${escapeAttr(last.thread.topic)}" closed="${when}">`];
   if (last.conclusion) lines.push(`  上次的结论：${escapeBlockText(last.conclusion.statement)}`);
   for (const turn of last.turns) {
-    lines.push(`  ${turn.turnNo}. 用户：${escapeBlockText(turn.userText.replace(/\s+/g, ' ').slice(0, 80))}`);
+    lines.push(`  ${turn.turnNo}. 用户：${escapeBlockText(turn.userText)}`);
   }
   lines.push('</handoff>');
   return lines.join('\n');
@@ -1113,7 +1129,7 @@ async function runExtraction(text, turnId, turnNo) {
       turnNo,
       turnId,
       at: Date.now(),
-      fallbackTopic: text.slice(0, 20),
+      fallbackTopic: firstSentence(text),
       previousThreadId: context.previousThreadId,
     });
     const ms = Date.now() - started;
@@ -1834,9 +1850,11 @@ async function runConsolidationStep() {
         existing: soul.conclusions(5).map((fact) => ({ id: fact.id, statement: fact.statement })),
         thread: {
           topic: context.thread.topic,
+          // Whole turns: consolidation reads the chapter, and a 160/120-character
+          // prefix cuts exactly where the decision usually is (the last clause).
           turns: context.turns.map((turn) => {
-            const answer = turn.assistantText.replace(/\s+/g, ' ').slice(0, 120);
-            return `用户：${turn.userText.slice(0, 160)}${answer ? ` / 我：${answer}` : ''}`;
+            const answer = turn.assistantText;
+            return `用户：${turn.userText}${answer ? ` / 我：${answer}` : ''}`;
           }),
         },
       }),

@@ -37,3 +37,18 @@ test('handoff: a thread without a conclusion still hands over its turns', () => 
   assert.doesNotMatch(block, /上次的结论/);
   assert.match(block, /7\. 用户：那先记录吧/);
 });
+
+test('handoff: user words go in whole — no prefix cuts', () => {
+  const longUser = '我把注入块里的线索原文都保留下来，因为截断会让后面的判断失去依据，尤其是最后一句往往才是结论';
+  const block = renderHandoff(
+    {
+      thread: { sessionId: 'session-old', topic: '一个相当长的主题标题用在交接块里也应该完整出现', closedAt: Date.now() },
+      conclusion: null,
+      turns: [{ turnNo: 3, userText: longUser }],
+    },
+    'session-new',
+  );
+  assert.ok(block.includes(longUser), '整句都在');
+  assert.ok(block.includes(longUser.slice(-6)), '结尾没有被切掉');
+  assert.match(block, /topic="一个相当长的主题标题用在交接块里也应该完整出现"/);
+});
