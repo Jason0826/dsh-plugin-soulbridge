@@ -32,7 +32,10 @@ param(
   # failed" — the 431 the crash log does not spell out. Clearing the store here
   # keeps it bounded, because this script is how the app is restarted.
   [switch]$CleanCookies,
-  [switch]$SkipFallback
+  [switch]$SkipFallback,
+  # The fallback removes the soulbridge bundle from the profile. That is destructive and
+  # was triggered by a false "did not start" on 2026-11-03, so it is opt-in now.
+  [switch]$AllowBundleRemoval
 )
 
 $logDir = Join-Path $env:USERPROFILE '.soulbridge'
@@ -50,11 +53,33 @@ function Get-AppProcesses {
   return @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
 }
 
+# Listening sockets can be owned by a child process (the webhost runs under an Electron
+# helper), so counting only the main process pids reports False while the app is serving —
+# observed 2026-11-03: three "starts failed" in a row against a healthy app. Walk the
+# process tree instead.
 function Get-ListenerCount {
-  $pids = (Get-AppProcesses | ForEach-Object { $_.Id })
-  if (-not $pids) { return 0 }
+  $appPids = @(Get-AppProcesses | ForEach-Object { $_.Id })
+  if ($appPids.Count -eq 0) { return 0 }
+  try {
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Select-Object ProcessId, ParentProcessId)
+  } catch {
+    return -1  # unknown: callers must not treat this as "not listening"
+  }
+  $tree = [System.Collections.Generic.HashSet[int]]::new()
+  foreach ($id in $appPids) { [void]$tree.Add([int]$id) }
+  $grew = $true
+  while ($grew) {
+    $grew = $false
+    foreach ($proc in $all) {
+      if ($tree.Contains([int]$proc.ParentProcessId) -and -not $tree.Contains([int]$proc.ProcessId)) {
+        [void]$tree.Add([int]$proc.ProcessId)
+        $grew = $true
+      }
+    }
+  }
   return @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $pids -contains $_.OwningProcess }).Count
+    Where-Object { $tree.Contains([int]$_.OwningProcess) }).Count
 }
 
 function Write-LatestCrash {
@@ -80,7 +105,7 @@ function Start-AndWatch([string]$label) {
   }
 
   $elapsed = 0
-  $sawListener = $false
+  $listenerState = 'unknown'   # 'listening' | 'none' | 'unknown'
   while ($elapsed -lt $StableSeconds) {
     Start-Sleep -Seconds 2
     $elapsed += 2
@@ -90,14 +115,20 @@ function Start-AndWatch([string]$label) {
       Write-LatestCrash
       return $false
     }
-    if (-not $sawListener -and (Get-ListenerCount) -gt 0) {
-      $sawListener = $true
+    $listeners = Get-ListenerCount
+    if ($listeners -gt 0 -and $listenerState -ne 'listening') {
+      $listenerState = 'listening'
       Write-Log "${label}: webhost listening after ${elapsed}s"
+    } elseif ($listeners -eq 0 -and $listenerState -eq 'unknown') {
+      $listenerState = 'none'
     }
   }
 
-  Write-Log "${label}: stable for ${StableSeconds}s (processes: $((Get-AppProcesses).Count), listener: $sawListener)"
-  return $sawListener
+  Write-Log "${label}: stable for ${StableSeconds}s (processes: $((Get-AppProcesses).Count), listener: $listenerState)"
+  # Process stability is the signal that matters. A missed listener is a measurement gap,
+  # not proof of failure — treating it as failure is what triggered a bogus bundle removal.
+  if ($listenerState -eq 'none') { Write-Log "${label}: listener not observed; accepting process stability" }
+  return $true
 }
 
 Write-Log "scheduled: waiting ${DelaySeconds}s before restart"
@@ -151,13 +182,18 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
   Write-Log "attempt $attempt failed"
 }
 
-if ($SkipFallback) {
-  Write-Log 'FAILED: no stable start, fallback skipped'
+if ($SkipFallback -or -not $AllowBundleRemoval) {
+  # Removing the bundle is destructive and one false "did not start" is enough to trigger it
+  # (measured 2026-11-03: three bogus failures against a healthy app). Report instead of
+  # acting; an operator decides whether the plugin is the cause.
+  Write-Log 'FAILED: app did not stay up; soulbridge bundle left untouched'
+  Write-Log 'if you are sure the plugin is the cause: rerun with -AllowBundleRemoval'
+  Write-LatestCrash
   exit 1
 }
 
-# Fallback: ship a working app without the plugin rather than no app at all.
-Write-Log 'fallback: disabling the soulbridge bundle'
+# Opt-in fallback: ship a working app without the plugin rather than no app at all.
+Write-Log 'fallback: disabling the soulbridge bundle (explicit -AllowBundleRemoval)'
 try {
   & 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -ExecutionPolicy Bypass `
     -File $manifestTool -Action remove-bundle -Name $Bundle *>> $log
