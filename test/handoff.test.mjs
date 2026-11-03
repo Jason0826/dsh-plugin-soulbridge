@@ -38,6 +38,19 @@ test('handoff: a thread without a conclusion still hands over its turns', () => 
   assert.match(block, /7\. 用户：那先记录吧/);
 });
 
+test('handoff: both sides of the turn are carried (ADR 0035)', () => {
+  const block = renderHandoff(
+    {
+      thread: { sessionId: 'session-old', topic: '定方案', closedAt: Date.now() },
+      conclusion: null,
+      turns: [{ turnNo: 5, userText: '用哪个方案', assistantText: '用 in-history，因为 section 会每轮变' }],
+    },
+    'session-new',
+  );
+  assert.match(block, /5\. 用户：用哪个方案/);
+  assert.match(block, /5\. 我：用 in-history/);
+});
+
 test('handoff: user words go in whole — no prefix cuts', () => {
   const longUser = '我把注入块里的线索原文都保留下来，因为截断会让后面的判断失去依据，尤其是最后一句往往才是结论';
   const block = renderHandoff(

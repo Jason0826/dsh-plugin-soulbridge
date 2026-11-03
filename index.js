@@ -704,8 +704,11 @@ export function renderHandoff(last, sessionId) {
   // many turns the caller carries, not by cutting each one.
   const lines = [`<handoff topic="${escapeAttr(last.thread.topic)}" closed="${when}">`];
   if (last.conclusion) lines.push(`  上次的结论：${escapeBlockText(last.conclusion.statement)}`);
+  // Both sides (ADR 0035): "where were we" includes where I was in the conversation,
+  // not only what the user asked. The reply is usually where the decision landed.
   for (const turn of last.turns) {
     lines.push(`  ${turn.turnNo}. 用户：${escapeBlockText(turn.userText)}`);
+    if (turn.assistantText) lines.push(`  ${turn.turnNo}. 我：${escapeBlockText(turn.assistantText)}`);
   }
   lines.push('</handoff>');
   return lines.join('\n');
@@ -1120,6 +1123,9 @@ async function runExtraction(text, turnId, turnNo) {
       // The extractor needs the open threads so it can say which one this turn
       // continues, and how long ago each was last seen.
       context,
+      // The exchange, not the message (ADR 0035): my reply is where promises and
+      // decisions live, and it is the only way "我的承诺" can ever be extracted.
+      assistantText: turnRow?.assistantText ?? undefined,
     });
     const result = soul.commitDrafts(draft, { turnId });
     // Attribution is written even when nothing was extracted: a turn that says
@@ -1133,10 +1139,14 @@ async function runExtraction(text, turnId, turnNo) {
       previousThreadId: context.previousThreadId,
     });
     const ms = Date.now() - started;
+    // Provenance is observable (ADR 0035): the fact count alone cannot tell whether
+    // anything came from my side of the exchange.
+    const inferred = result.facts.filter((fact) => fact.source === 'inferred').length;
     log(
       `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
         ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
+        ` inferred=${inferred}` +
         ` ms=${ms} turn=${turnNo}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
         ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
