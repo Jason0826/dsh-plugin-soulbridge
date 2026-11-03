@@ -119,17 +119,22 @@ Write-Log "processes remaining after stop: $((Get-AppProcesses).Count)"
 # The file is locked by the running app, so this is the only window to read it.
 $cookieDir = Join-Path $env:APPDATA '@deepseek-ai\dsh-desktop\Network'
 $cookieFile = Join-Path $cookieDir 'Cookies'
+# The store grows by one cookie per start (~228 bytes) with a 30-day life and no pruning.
+# Node rejects the request header past 16KB, so waiting for the crash is waiting for a
+# restart loop. Clear on size instead: 12KB leaves margin, and a normal start stays under it.
+$cookieLimitBytes = 12 * 1024
 if (Test-Path $cookieFile) {
   $cookieBytes = (Get-Item $cookieFile).Length
-  Write-Log "cookies: $cookieBytes bytes before start"
-  if ($CleanCookies) {
+  Write-Log "cookies: $cookieBytes bytes before start (limit $cookieLimitBytes)"
+  if ($CleanCookies -or $cookieBytes -gt $cookieLimitBytes) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backup = Join-Path $logDir "cookies-backup-$stamp.db"
     try {
       Copy-Item $cookieFile $backup -Force
       Remove-Item $cookieFile -Force
       Remove-Item (Join-Path $cookieDir 'Cookies-journal') -Force -ErrorAction SilentlyContinue
-      Write-Log "cookies: cleared (backup $backup)"
+      $why = if ($CleanCookies) { 'requested' } else { 'over limit' }
+      Write-Log "cookies: cleared ($why, backup $backup)"
     } catch {
       Write-Log "cookies: clear failed: $($_.Exception.Message)"
     }
