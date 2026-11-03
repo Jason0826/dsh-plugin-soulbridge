@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-soulbridge",
-  "version": "0.0.102",
+  "version": "0.0.103",
   "description": "Inject soulbridge context into DSH sessions and feed user turns back as observations.",
   "type": "module",
   "main": "index.js",
@@ -39,7 +39,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "prepare": "node scripts/install-hooks.mjs"
+    "setup": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "soulbridge": "^0.0.98"
