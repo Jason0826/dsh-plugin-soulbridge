@@ -15,8 +15,7 @@ param(
   [int]$WaitSeconds = 90,
   [string]$DshCli = 'C:\Users\DELL\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd',
   [string]$Exe = 'C:\Users\DELL\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe',
-  [string]$ProcessName = 'DeepSeek Harness',
-  [switch]$OpenBrowser
+  [string]$ProcessName = 'DeepSeek Harness'
 )
 
 $logDir = Join-Path $env:USERPROFILE '.soulbridge'
@@ -58,9 +57,17 @@ for ($waited = 0; $waited -lt $WaitSeconds; $waited += 2) {
 }
 
 if ($ok) {
-  if ($OpenBrowser) {
-    Start-Process "http://127.0.0.1:$Port" | Out-Null
-    Write-Log 'switch: opened browser'
+  # The bare address answers 401: the root path wants the one-time token the host prints.
+  # Copy that line out of our own log instead of handing the browser a URL it cannot use.
+  $tokenLine = Get-Content $log -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match "dsh web: http://127\.0\.0\.1:$Port/\?token=" } |
+    Select-Object -Last 1
+  if ($tokenLine) {
+    $url = ($tokenLine -split 'dsh web: ')[1].Trim()
+    Start-Process $url | Out-Null
+    Write-Log "switch: opened browser with token URL"
+  } else {
+    Write-Log 'switch: token URL not found in the host output; not opening the bare address (it 401s)'
   }
   Write-Log 'switch: done (fixed port)'
   exit 0
