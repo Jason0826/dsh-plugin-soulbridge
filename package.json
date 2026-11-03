@@ -38,7 +38,8 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
     "soulbridge": "file:D:/git-workspace/repos/soulbridge"
