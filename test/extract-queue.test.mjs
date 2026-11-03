@@ -41,6 +41,15 @@ test('extract queue: the cap keeps the newest work', () => {
   assert.equal(queue.at(-1).turnId, 'cap-59');
 });
 
+test('extract queue: an item remembers where it came from', () => {
+  writeFileSync(queueFile, '[]', 'utf8');
+  mod.enqueueExtraction('t-live', 1);
+  mod.enqueueExtraction('t-back', 2, 'backfill');
+  const queue = readQueue();
+  assert.equal(queue[0].origin, 'live', '默认是实时轮次');
+  assert.equal(queue[1].origin, 'backfill', '回填必须可区分，否则会污染实验样本');
+});
+
 test.after(() => {
   try {
     rmSync(home, { recursive: true, force: true });

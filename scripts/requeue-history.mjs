@@ -59,9 +59,9 @@ const size = () => {
 
 let added = 0;
 for (const row of rows) {
-  if (enqueueExtraction(String(row.id), Number(row.turn_no))) added += 1;
+  if (enqueueExtraction(String(row.id), Number(row.turn_no), 'backfill')) added += 1;
 }
 console.log(
   `待抽取总数 ${remaining.n}；本次请求 ${rows.length}，新增 ${added}，队列文件现在 ${size()} 条` +
-    `（最早 ${rows[0].turn_no}，最晚 ${rows.at(-1).turn_no}）`,
+    `（最早 ${rows[0].turn_no}，最晚 ${rows.at(-1).turn_no}）；origin=backfill（不计入归属实验）`,
 );

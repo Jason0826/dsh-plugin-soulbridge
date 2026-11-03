@@ -1073,12 +1073,15 @@ function bumpExtractAttempt(turnId) {
  * (capped at 50 by the writer it bypassed, with no line saying so). One writer, one
  * cap, one log line.
  */
-export function enqueueExtraction(turnId, turnNo) {
+export function enqueueExtraction(turnId, turnNo, origin = 'live') {
   const queue = readExtractQueue();
   if (queue.some((item) => item.turnId === turnId)) return false;
-  queue.push({ turnId, turnNo, attempts: 0 });
+  // `origin` separates live turns from a historical backfill. Without it the attribution
+  // experiment counts re-extracted old turns as fresh evidence, and a verdict about the
+  // new default-continue rule would be read off history that never saw that rule.
+  queue.push({ turnId, turnNo, attempts: 0, origin });
   writeExtractQueue(queue);
-  log(`extract queued turn=${turnNo} pending=${queue.length} file=${EXTRACT_QUEUE_FILE}`);
+  log(`extract queued turn=${turnNo} origin=${origin} pending=${queue.length} file=${EXTRACT_QUEUE_FILE}`);
   return true;
 }
 
@@ -1095,7 +1098,7 @@ function hasSubstance(text) {
   return !/^(好的?|嗯+|哦+|可以|行|ok|okay|收到|明白|继续|好)[。！!.\s]*$/i.test(trimmed);
 }
 
-async function runExtraction(text, turnId, turnNo) {
+async function runExtraction(text, turnId, turnNo, origin = 'live') {
   const config = readConfig();
   if (config.extract === 'off') return 'skipped-off';
   if (typeof text !== 'string' || !hasSubstance(text)) {
@@ -1147,7 +1150,7 @@ async function runExtraction(text, turnId, turnNo) {
         ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +
-        ` ms=${ms} turn=${turnNo}` +
+        ` ms=${ms} turn=${turnNo} origin=${origin}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
         ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
         `${attribution.topicUpdated ? ' topic=updated' : ''}`,
@@ -1174,6 +1177,7 @@ async function runExtraction(text, turnId, turnNo) {
       threadTopic: attribution.topic,
       threadLine: draft.threadLine ?? null,
       topicUpdated: attribution.topicUpdated,
+      origin,
       joinReason: attribution.joinReason,
       ms,
     });
@@ -1233,7 +1237,7 @@ export async function drainExtractionQueue() {
       return;
     }
 
-    const outcome = await runExtraction(text, item.turnId, item.turnNo);
+    const outcome = await runExtraction(text, item.turnId, item.turnNo, item.origin ?? 'live');
     const ok =
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
