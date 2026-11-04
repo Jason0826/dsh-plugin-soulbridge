@@ -61,6 +61,18 @@ test('drain: rules mode counts as complete, not as a retry', async () => {
   assert.equal(readQueue().length, 0, 'both items are consumed in rules mode');
 });
 
+test('drain: a turn inside a thread extracts the whole thread, once', async () => {
+  // Two turns of the same topic: extracting the first must also cover the second,
+  // or the topic is mined sentence by sentence (0025).
+  const thread = soul.applyThread(undefined, { sessionId: 's', turnNo: 1, turnId: first, at: Date.now() });
+  soul.applyThread({ kind: 'continue', id: thread.threadId }, { sessionId: 's', turnNo: 2, turnId: second, at: Date.now() });
+  seed();
+  await drainExtractionQueue();
+  assert.equal(readQueue().length, 0, 'both turns of the thread are covered by one extraction');
+  const log = readFileSync(join(home, 'plugin.log'), 'utf8');
+  assert.match(log, /unit=2turns threadId=th_/, 'the log says the unit was the thread');
+});
+
 test.after(() => {
   store.close();
   try {

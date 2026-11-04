@@ -1099,6 +1099,17 @@ function bumpExtractAttempt(turnId) {
 }
 
 /**
+ * After a thread was extracted, every queued turn of that thread is already covered.
+ * Leaving them would extract the same topic again, turn by turn (0025).
+ */
+function removeExtractItemsOfThread(threadId, turnIds) {
+  if (!threadId) return;
+  writeExtractQueue(
+    readExtractQueue().filter((item) => !turnIds.includes(item.turnId)),
+  );
+}
+
+/**
  * Add one turn to the extraction queue.
  *
  * Exported so a script can batch-requeue history through the same writer: the last
@@ -1131,7 +1142,7 @@ function hasSubstance(text) {
   return !/^(好的?|嗯+|哦+|可以|行|ok|okay|收到|明白|继续|好)[。！!.\s]*$/i.test(trimmed);
 }
 
-async function runExtraction(text, turnId, turnNo, origin = 'live') {
+async function runExtraction(text, turnId, turnNo, origin = 'live', thread = null) {
   const config = readConfig();
   if (config.extract === 'off') return 'skipped-off';
   if (typeof text !== 'string' || !hasSubstance(text)) {
@@ -1153,6 +1164,10 @@ async function runExtraction(text, turnId, turnNo, origin = 'live') {
       const previousThreadId = soul.threadBefore(turnRow.sessionId, turnNo);
       if (previousThreadId) context.previousThreadId = previousThreadId;
     }
+    // 0025: the unit is the whole topic when the turn belongs to one. The turns array is
+    // numbered the way the prompt numbers them, and each fact may name its own turn.
+    const turns = thread?.turns ?? null;
+    const turnIds = turns ? Object.fromEntries(turns.map((entry) => [entry.turnNo, entry.id])) : undefined;
     const draft = await soul.extract(text, {
       llm: useLlm ? injectedLlm : undefined,
       mode: useLlm ? 'auto' : 'rules',
@@ -1162,8 +1177,9 @@ async function runExtraction(text, turnId, turnNo, origin = 'live') {
       // The exchange, not the message (ADR 0035): my reply is where promises and
       // decisions live, and it is the only way "我的承诺" can ever be extracted.
       assistantText: turnRow?.assistantText ?? undefined,
+      turns: turns ?? undefined,
     });
-    const result = soul.commitDrafts(draft, { turnId });
+    const result = soul.commitDrafts(draft, { turnId, turnIds });
     // Attribution is written even when nothing was extracted: a turn that says
     // "无" (nothing worth remembering) can still be part of a thread.
     const attribution = soul.applyThread(draft.thread, {
@@ -1183,6 +1199,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live') {
         ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +
+        ` unit=${turns ? `${turns.length}turns` : '1turn'} threadId=${thread?.id ?? '-'}` +
         ` ms=${ms} turn=${turnNo} origin=${origin}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
         ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
@@ -1276,9 +1293,21 @@ export async function drainExtractionQueue() {
   try {
     const item = pickExtractionItem(queue);
     let text = '';
+    let thread = null;
     try {
-      const turn = ensureSoul().turn(item.turnId);
+      const soul = ensureSoul();
+      const turn = soul.turn(item.turnId);
       text = turn?.userText ?? '';
+      // A turn is a trigger, the topic is the unit (0025). When the turn is already in a
+      // thread, extract that thread's turns instead of this message alone.
+      const threadId = soul.turnThreadId(item.turnId);
+      if (threadId) {
+        const turns = soul.threadTurns(threadId);
+        if (turns.length > 0) {
+          thread = { id: threadId, turns };
+          text = turns[turns.length - 1].userText;
+        }
+      }
     } catch {
       text = '';
     }
@@ -1288,14 +1317,21 @@ export async function drainExtractionQueue() {
       return;
     }
 
-    const outcome = await runExtraction(text, item.turnId, item.turnNo, item.origin ?? 'live');
+    const outcome = await runExtraction(text, item.turnId, item.turnNo, item.origin ?? 'live', thread);
     const ok =
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
-      removeExtractItem(item.turnId);
-      // Promotion is decided after the facts exist: a corrected turn's lessons enter
-      // the classification queue here, which is the only live producer it has.
-      feedClassifyFromTurn(item.turnId);
+      if (thread) {
+        removeExtractItemsOfThread(thread.id, thread.turns.map((entry) => entry.id));
+        // Promotion is decided after the facts exist; a whole thread can hold several
+        // corrected turns, so every turn is offered.
+        for (const entry of thread.turns) feedClassifyFromTurn(entry.id);
+      } else {
+        removeExtractItem(item.turnId);
+        // Promotion is decided after the facts exist: a corrected turn's lessons enter
+        // the classification queue here, which is the only live producer it has.
+        feedClassifyFromTurn(item.turnId);
+      }
       trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome });
       return true;
     }
