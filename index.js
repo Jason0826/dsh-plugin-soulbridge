@@ -88,6 +88,151 @@ function trace(record) {
   }
 }
 
+/** A turn that reaches this many model requests gets one line in plugin.log (0026). */
+const TURN_REQUEST_ALERT = 30;
+/** Subagent sessions each open a turn; past this many, the oldest unfinished turn is written out. */
+const TURN_TRACKER_MAX = 64;
+
+/**
+ * What one turn cost, in requests and tokens (brief 0026).
+ *
+ * The platform export is one line per day, so the turn that actually burned the
+ * money is invisible until the day is over. The host's event stream already
+ * carries everything needed to attribute it:
+ *
+ *   step/start          one model call was scheduled
+ *   assistant/attempt   a call that was retried and produced no message
+ *   assistant/message   a finished call, with the usage it reported
+ *   turn/start, turn/end  the window
+ *
+ * A subagent runs in its own session and therefore gets its own record; the
+ * event stream has no parent link, and guessing one would be worse than two
+ * honest lines. Money is deliberately absent — prices have peak/off-peak tiers
+ * and change, so amounts come only from `scripts/billing.mjs` in core.
+ *
+ * @param {object} [options]
+ * @param {number} [options.threshold] request count that triggers the log line.
+ * @param {number} [options.maxTurns] unfinished turns kept before the oldest is written out.
+ * @param {(record: object) => void} [options.onReport] called once per finished turn.
+ * @param {(line: string) => void} [options.onAlert] called when a turn reaches the threshold.
+ */
+export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns = TURN_TRACKER_MAX, onReport, onAlert } = {}) {
+  const open = new Map();
+  let lastSession;
+
+  const addUsage = (entry, usage) => {
+    if (!usage) return;
+    entry.input += Number(usage.inputTokens) || 0;
+    entry.cacheHit += Number(usage.cacheReadTokens) || 0;
+    entry.cacheWrite += Number(usage.cacheWriteTokens) || 0;
+    entry.output += Number(usage.outputTokens) || 0;
+  };
+
+  const requestsOf = (entry) => entry.steps + entry.failed + entry.plugin;
+
+  /** Write the record once, then forget the turn. `complete` is false for interrupted/evicted turns. */
+  const finish = (session, entry, reason, endedAt, complete) => {
+    open.delete(session);
+    const requests = requestsOf(entry);
+    if (requests === 0) return;
+    const secs = Math.max(0, Math.round((endedAt - entry.startedAt) / 1000));
+    const record = {
+      event: 'turn-cost',
+      session,
+      turn: entry.turn,
+      requests,
+      steps: entry.steps,
+      failed: entry.failed,
+      plugin: entry.plugin,
+      input: entry.input,
+      cacheHit: entry.cacheHit,
+      cacheWrite: entry.cacheWrite,
+      output: entry.output,
+      secs,
+      ...(complete ? {} : { open: true }),
+      ...(reason === undefined ? {} : { reason }),
+    };
+    onReport?.(record);
+    if (requests >= threshold) {
+      onAlert?.(
+        `turn cost: session=${session} turn=${entry.turn} requests=${requests}` +
+          ` (steps=${entry.steps} failed=${entry.failed} plugin=${entry.plugin})` +
+          ` input=${entry.input} cacheHit=${entry.cacheHit} output=${entry.output}` +
+          ` secs=${secs}${complete ? '' : ' open'}`,
+      );
+    }
+  };
+
+  return {
+    /**
+     * Feed one session event. Events of a session whose turn was never opened are
+     * ignored rather than attached to a neighbour: a wrong attribution is worse
+     * than a missing one.
+     * @param {string} session - session id the event belongs to.
+     * @param {{type?: string, time?: number, data?: object}} event - host session event.
+     */
+    observe(session, event) {
+      const type = event?.type;
+      const data = event?.data ?? {};
+      if (typeof data.turn !== 'number') return;
+      lastSession = session;
+      const entry = open.get(session);
+      if (type === 'turn/start') {
+        if (entry) finish(session, entry, 'restarted', event?.time ?? Date.now(), false);
+        open.set(session, {
+          turn: data.turn,
+          startedAt: event?.time ?? Date.now(),
+          steps: 0,
+          failed: 0,
+          plugin: 0,
+          input: 0,
+          cacheHit: 0,
+          cacheWrite: 0,
+          output: 0,
+        });
+        if (open.size > maxTurns) {
+          const oldest = open.keys().next().value;
+          finish(oldest, open.get(oldest), 'evicted', Date.now(), false);
+        }
+        return;
+      }
+      if (!entry || entry.turn !== data.turn) return;
+      if (type === 'step/start') entry.steps += 1;
+      else if (type === 'assistant/attempt') entry.failed += 1;
+      else if (type === 'assistant/message') addUsage(entry, data.usage);
+      else if (type === 'turn/end') {
+        finish(session, entry, data.reason?.kind, event?.time ?? Date.now(), true);
+      }
+    },
+    /**
+     * Count one model call made by this plugin, attributed to the turn it ran
+     * inside. The turn is the most recent one the host reported an event for —
+     * the stage chain only runs while that turn is live.
+     */
+    pluginCall() {
+      if (lastSession === undefined) return;
+      const entry = open.get(lastSession);
+      if (!entry) return;
+      entry.plugin += 1;
+    },
+    /**
+     * Add the tokens a plugin call reported to the same turn. Separate from
+     * {@link pluginCall} because the request is counted when it is dispatched
+     * (a failed call still costs money) while its usage only arrives at the end.
+     * @param {{inputTokens?: number, cacheReadTokens?: number, cacheWriteTokens?: number, outputTokens?: number}} [usage]
+     *   usage the call reported; absent when the call failed before reporting.
+     */
+    pluginUsage(usage) {
+      if (lastSession === undefined) return;
+      const entry = open.get(lastSession);
+      if (!entry) return;
+      addUsage(entry, usage);
+    },
+    /** Unfinished turns currently held (observability for the bound in tests). */
+    openCount: () => open.size,
+  };
+}
+
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
 
 /**
@@ -134,6 +279,8 @@ function readConfig() {
 /** Adapter side of the core LlmFn port: the host model, called inside a turn. */
 let currentTurn;
 let currentStep;
+/** Per-turn cost accounting (0026); null until apply() attaches it (tests import this module bare). */
+let turnCostTracker;
 
 // Measured, not guessed: 279 calls, p50=1.7s p90=6.8s p99=46.7s, max=142.9s.
 // 90s is ~2x p99 and caps a hung call without cutting the ordinary tail.
@@ -170,6 +317,11 @@ export function makeLlm(ctx, config) {
     // a call actually lands in.
     const started = Date.now();
     log(`llm probe: start turn=${currentTurn ?? '?'} step=${currentStep ?? '?'} chars=${prompt.length}`);
+    // This call is a model request too (0026): count it, and keep the usage the
+    // stream reports so the turn's token total is complete rather than just its
+    // agent-loop part.
+    let usage;
+    turnCostTracker?.pluginCall();
     try {
       const text = await withTimeout(
         collectText(
@@ -185,10 +337,14 @@ export function makeLlm(ctx, config) {
               },
             ],
           }),
+          (reported) => {
+            usage = reported;
+          },
         ),
         LLM_TIMEOUT_MS,
         'llm call',
       );
+      turnCostTracker?.pluginUsage(usage);
       log(
         `llm probe: end ok ms=${Date.now() - started} out=${typeof text === 'string' ? text.length : -1}` +
           ` step=${currentStep ?? '?'}`,
@@ -215,8 +371,12 @@ export function makeLlm(ctx, config) {
  * `finish{reason:{kind:'error'|'aborted'}}` instead of throwing, so without this
  * check the failure came back as `''` and the caller read it as "the model said
  * nothing". `collectText` throws unless some text was produced before the failure.
+ *
+ * @param {AsyncIterable<object>} stream - chunks of one model call.
+ * @param {(usage: object) => void} [onUsage] called with the usage chunk, if the
+ *   adapter reported one; without it a call's tokens have no reader (0026).
  */
-export async function collectText(stream) {
+export async function collectText(stream, onUsage) {
   let text = '';
   let sawDelta = false;
   let failure;
@@ -226,6 +386,8 @@ export async function collectText(stream) {
       sawDelta = true;
     } else if (!sawDelta && chunk.type === 'block-end' && chunk.block?.type === 'text') {
       text += chunk.block.text ?? '';
+    } else if (chunk.type === 'usage' && chunk.usage) {
+      onUsage?.(chunk.usage);
     } else if (chunk.type === 'finish' && (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted')) {
       failure = chunk.reason;
     }
@@ -2280,6 +2442,14 @@ export function apply(ctx) {
   // Backfill is triggered by the first user message, not here: at apply() time
   // the host model service is not mounted yet and every call fails.
 
+  // Per-turn cost (0026): a turn's record goes to trace.jsonl, and a turn that
+  // reaches the threshold also gets one line in plugin.log. Attached before the
+  // event listener so no turn can be missed.
+  turnCostTracker = createTurnCostTracker({
+    onReport: (record) => trace(record),
+    onAlert: (line) => log(line),
+  });
+
   try {
     ctx.effect(
       () => {
@@ -2365,6 +2535,10 @@ export function apply(ctx) {
       );
 
       const sessionId = session?.id ?? 'default';
+
+      // Before any early return below: turn/end is where the cost record is
+      // written, and that branch returns.
+      turnCostTracker?.observe(sessionId, event);
 
       // Keep the last reply: a correction only makes sense next to what it targets.
       if (typeof event.data?.turn === 'number') currentTurn = event.data.turn;

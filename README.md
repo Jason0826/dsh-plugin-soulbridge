@@ -45,6 +45,7 @@ dsh plugin --profile desktop add "github:Jason0826/dsh-plugin-soulbridge#v0.0.4"
 | `user/message source=user chars=N` | 收到用户消息 |
 | `soul ready: db=… soul=… user=…` | core 与数据库就绪 |
 | `observe ok: chars=… written=… affect=… confidence=…` | **整条链路成功** |
+| `turn cost: session=… turn=… requests=N (steps=… failed=… plugin=…)` | 这一轮的请求数到了 30（见下节） |
 | `skipping profile bundle …` (stderr) | bundle 被启动器跳过，原因就在后面 |
 
 ## 卸载
@@ -94,6 +95,20 @@ DSH 启动器对 `package.json` 直接 `JSON.parse`，不剥 BOM。用 Windows P
 为什么是"规则优先、模型补漏"：实测规则精确率 1.00，但 26 条真实消息里漏了 19 条；
 让模型覆盖规则没有收益，只在漏掉时补才有。宿主模型**只能在真实轮次内调用**，
 启动时调用会被账号 provider 拒绝（见 `docs/experiment-2026-10-29-host-llm.md`）。
+
+## 每轮花了多少（0026）
+
+平台导出只有"每天一行"，单轮花大钱看不出来。所以插件自己记：
+
+| 落点 | 什么时候 | 内容 |
+|---|---|---|
+| `trace.jsonl` 的 `{"event":"turn-cost"}` | 每轮结束 | 请求数（= 步骤 + 失败尝试 + 插件自己的调用）、四类 token、耗时、结束原因 |
+| `plugin.log` 的 `turn cost:` | 一轮 ≥ 30 次请求 | 同一份数字压成一行 |
+
+计数来源是宿主的事件流：`step/start`（一次调用）、`assistant/attempt`（重试且没出消息）、
+`assistant/message.usage`（token）。子代理跑在自己的会话里，因此各自一条记录——事件流
+里没有父子关系，猜一个比写两条更坏。插件**不算钱**：金额只从 `scripts/billing.mjs`
+（读平台导出）来，价目有峰谷两档且会变。
 ## 升级提示：新增工具需要新开会话
 
 `ctx.inject(['tools'])` 注册的工具在**会话创建时**进入该会话的工具集。插件升级后
