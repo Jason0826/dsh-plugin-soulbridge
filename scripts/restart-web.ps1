@@ -13,7 +13,8 @@ param(
   [string]$TaskName = 'DshWebHost',
   [string]$ProcessName = 'DeepSeek Harness',
   [switch]$KeepDesktop,
-  [switch]$NoBrowser,
+  # Only opens a browser tab when asked. Unattended restarts must not leave dead tabs behind.
+  [switch]$OpenBrowser,
   # Emergency escape only: a red review gate means the batch was not looked at as a whole.
   [switch]$SkipReviewGate
 )
@@ -124,7 +125,10 @@ Set-Content -Path $urlFile -Value $url -Encoding utf8
 ) | Set-Content -Path $shortcut -Encoding ascii
 Write-Log "web-restart: ready at $url (shortcut: $shortcut)"
 
-if (-not $NoBrowser) {
+# Opening a tab is opt-in: the token URL changes on every restart, so the old tab cannot be
+# reused — but auto-opening on every unattended restart left a browser full of dead tabs.
+# The shortcut is always rewritten, so a human needs one click only when they want one.
+if ($OpenBrowser) {
   Start-Process $url | Out-Null
   Write-Log 'web-restart: opened browser'
 }
