@@ -56,6 +56,21 @@ test('hooks: stay short — one line per fact, not the conversation', () => {
   assert.doesNotMatch(hooks.text, /\[Q\]/, 'no conversation replay in hooks');
 });
 
+test('hooks: a fact I said is marked once, and the explanation appears once', () => {
+  soul.recordFact({
+    statement: '我认为阿珍只是最近太累了',
+    source: 'inferred',
+    slots: [{ slot: '参与者', value: { kind: 'entity', entityId: her.id } }],
+  });
+  const hooks = buildFactHooks('阿珍最近怎么样');
+  assert.match(hooks.text, /- 我: \[fc_[a-z0-9_]+\] 我认为阿珍只是最近太累了/);
+  assert.equal(
+    hooks.text.split('<source-notes>').length - 1,
+    1,
+    'one explanation for the whole block, not one per fact',
+  );
+});
+
 test.after(() => {
   store.close();
   // The plugin keeps its own handle on the same database, so removal can fail

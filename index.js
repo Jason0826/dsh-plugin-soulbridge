@@ -484,6 +484,7 @@ export function mentions(text, entity) {
 export function buildFactHooks(text, options = {}) {
   const parts = [];
   const used = [];
+  let sawInferred = false;
   try {
     const known = ensureSoul().findEntities('', 50);
     // The entity timeline already covers the subject of an entity question;
@@ -499,7 +500,11 @@ export function buildFactHooks(text, options = {}) {
         if (seen.has(fact.id)) continue;
         seen.add(fact.id);
         const when = fact.atText ?? (fact.at ? new Date(fact.at).toISOString().slice(0, 10) : '');
-        lines.push(`- [${fact.id}] ${escapeBlockText(fact.statement)}${when ? `（${escapeBlockText(when)}）` : ''}`);
+        // ADR 0035: a fact from my side of the exchange is inferred. Two characters plus one
+        // explanation below the block, because a per-line sentence would double the text.
+        const marker = fact.source === 'inferred' ? '我: ' : '';
+        if (marker) sawInferred = true;
+        lines.push(`- ${marker}[${fact.id}] ${escapeBlockText(fact.statement)}${when ? `（${escapeBlockText(when)}）` : ''}`);
         used.push(fact.id);
       }
       if (lines.length > 0) {
@@ -510,6 +515,11 @@ export function buildFactHooks(text, options = {}) {
     log(`prestep: hooks failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (parts.length === 0) return '';
+  if (sawInferred) {
+    parts.push(
+      '<source-notes>以「我:」开头的是我上一轮说的话，未经用户确认；没标的都是用户说的。</source-notes>',
+    );
+  }
   return { text: parts.join('\n\n'), used };
 }
 

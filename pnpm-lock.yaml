@@ -9,16 +9,16 @@ importers:
   .:
     dependencies:
       soulbridge:
-        specifier: file:D:/git-workspace/repos/soulbridge
-        version: file:../soulbridge
+        specifier: '>=0.0.100 <0.1.0'
+        version: 0.0.100
 
 packages:
 
-  soulbridge@file:../soulbridge:
-    resolution: {directory: ../soulbridge, type: directory}
+  soulbridge@0.0.100:
+    resolution: {integrity: sha512-5hKtMIjXySJdmk1zAS/LIaRF8zse2MPdaFz443HUWosdRqucXzT4UbA1FzZZ8kjeN5LjsOPHwU4dj3WcWMcu9g==}
     engines: {node: '>=22.18'}
     hasBin: true
 
 snapshots:
 
-  soulbridge@file:../soulbridge: {}
+  soulbridge@0.0.100: {}
