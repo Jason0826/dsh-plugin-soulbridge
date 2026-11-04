@@ -37,6 +37,8 @@ import {
   readVerification,
   escapeAttr,
   escapeBlockText,
+  INFERRED_MARKER,
+  SOURCE_NOTES,
 } from 'soulbridge';
 
 export const name = 'dsh-plugin-soulbridge';
@@ -502,7 +504,7 @@ export function buildFactHooks(text, options = {}) {
         const when = fact.atText ?? (fact.at ? new Date(fact.at).toISOString().slice(0, 10) : '');
         // ADR 0035: a fact from my side of the exchange is inferred. Two characters plus one
         // explanation below the block, because a per-line sentence would double the text.
-        const marker = fact.source === 'inferred' ? '我: ' : '';
+        const marker = fact.source === 'inferred' ? INFERRED_MARKER : '';
         if (marker) sawInferred = true;
         lines.push(`- ${marker}[${fact.id}] ${escapeBlockText(fact.statement)}${when ? `（${escapeBlockText(when)}）` : ''}`);
         used.push(fact.id);
@@ -515,11 +517,7 @@ export function buildFactHooks(text, options = {}) {
     log(`prestep: hooks failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (parts.length === 0) return '';
-  if (sawInferred) {
-    parts.push(
-      '<source-notes>以「我:」开头的是我上一轮说的话，未经用户确认；没标的都是用户说的。</source-notes>',
-    );
-  }
+  if (sawInferred) parts.push(SOURCE_NOTES);
   return { text: parts.join('\n\n'), used };
 }
 

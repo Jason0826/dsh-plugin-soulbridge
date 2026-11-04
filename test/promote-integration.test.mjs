@@ -42,7 +42,9 @@ test('T1: a corrected turn promotes its flagged lesson into the classify queue',
     at,
     typeName: '要求',
     holder: 'world',
-    slots: [{ slot: '原则候选', value: { kind: 'text', value: '是' } }],
+    // The structured form of "this is a lesson to classify": role + status, not a slot.
+    role: 'lesson',
+    status: 'candidate',
   });
   store.putFact({
     ...scope,
