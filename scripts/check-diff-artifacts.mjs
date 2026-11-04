@@ -35,7 +35,12 @@ for (const line of diff.split('\n')) {
   if (header) file = header[1];
   if (!line.startsWith('+') || line.startsWith('+++')) continue;
   const added = line.slice(1);
-  if (/\u0060n(?![A-Za-z])/.test(added)) problems.push(`${file}: 换行写成了反引号+n：${added.slice(0, 60)}`);
+  // In PowerShell a double-quoted string writes a newline as backtick + n on purpose, so
+  // flagging it made the gate refuse its own deploy script. The accident this catches is a
+  // literal backtick-n in text or code where a real newline was meant, so .ps1 files are exempt.
+  if (!/\.ps1$/i.test(file) && /\u0060n(?![A-Za-z])/.test(added)) {
+    problems.push(`${file}: 换行写成了反引号+n：${added.slice(0, 60)}`);
+  }
   if (/^(ode|pm|px|ot) /.test(added)) problems.push(`${file}: 行首残片（首字母被吃掉）：${added.slice(0, 40)}`);
 }
 

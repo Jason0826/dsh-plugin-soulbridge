@@ -13,7 +13,9 @@ param(
   [string]$TaskName = 'DshWebHost',
   [string]$ProcessName = 'DeepSeek Harness',
   [switch]$KeepDesktop,
-  [switch]$NoBrowser
+  [switch]$NoBrowser,
+  # Emergency escape only: a red review gate means the batch was not looked at as a whole.
+  [switch]$SkipReviewGate
 )
 
 $homeDir = Join-Path $env:USERPROFILE '.soulbridge'
@@ -37,6 +39,31 @@ function Get-HostPids {
 if ($DelaySeconds -gt 0) {
   Write-Log "web-restart: waiting ${DelaySeconds}s"
   Start-Sleep -Seconds $DelaySeconds
+}
+
+# 0. Refuse to deploy without the review the checklist asks for.
+#
+# The health-check review gate fires after commits, while the habit was to run health-check
+# before committing — so it was always green at the moment someone looked and red afterwards.
+# Putting it in front of the restart is the only place that cannot be skipped.
+$repoRoot = 'D:\git-workspace\repos\soulbridge'
+$healthScript = Join-Path $repoRoot 'scripts\health-check.mjs'
+if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
+  $cmd = Get-Command node -ErrorAction SilentlyContinue
+  $node = if ($cmd) { $cmd.Source } else { $null }
+  if (-not $node -and (Test-Path 'C:\Program Files\nodejs\node.exe')) { $node = 'C:\Program Files\nodejs\node.exe' }
+  if ($node) {
+    $health = & $node $healthScript --no-tests 2>&1 | Out-String
+    if ($health -match '✗ \[review\]') {
+      Write-Log 'web-restart: REFUSED - the review gate is red (write a docs/audit review first)'
+      ($health -split "`n" | Where-Object { $_ -match 'review' } | Select-Object -First 2) |
+        ForEach-Object { Write-Log "web-restart: $_" }
+      exit 1
+    }
+    Write-Log 'web-restart: review gate ok'
+  } else {
+    Write-Log 'web-restart: node not on PATH; review gate skipped'
+  }
 }
 
 # 1. One runtime, one client: the desktop app must go before the web host can own it.
