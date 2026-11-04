@@ -46,6 +46,10 @@ if ($DelaySeconds -gt 0) {
 # The health-check review gate fires after commits, while the habit was to run health-check
 # before committing — so it was always green at the moment someone looked and red afterwards.
 # Putting it in front of the restart is the only place that cannot be skipped.
+#
+# The decision is an exit code, not a string match: the first version matched '✗ [review]' in
+# the captured output, and PowerShell 5.1 decodes that child output with the system code page,
+# so the regex matched a PASS line and refused a clean deploy (2026-11-04 11:21).
 $repoRoot = 'D:\git-workspace\repos\soulbridge'
 $healthScript = Join-Path $repoRoot 'scripts\health-check.mjs'
 if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
@@ -53,11 +57,9 @@ if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
   $node = if ($cmd) { $cmd.Source } else { $null }
   if (-not $node -and (Test-Path 'C:\Program Files\nodejs\node.exe')) { $node = 'C:\Program Files\nodejs\node.exe' }
   if ($node) {
-    $health = & $node $healthScript --no-tests 2>&1 | Out-String
-    if ($health -match '✗ \[review\]') {
+    $null = & $node $healthScript --no-tests --gate=review 2>&1
+    if ($LASTEXITCODE -ne 0) {
       Write-Log 'web-restart: REFUSED - the review gate is red (write a docs/audit review first)'
-      ($health -split "`n" | Where-Object { $_ -match 'review' } | Select-Object -First 2) |
-        ForEach-Object { Write-Log "web-restart: $_" }
       exit 1
     }
     Write-Log 'web-restart: review gate ok'
