@@ -9,16 +9,16 @@ importers:
   .:
     dependencies:
       soulbridge:
-        specifier: '>=0.0.107 <0.1.0'
-        version: 0.0.107
+        specifier: '>=0.0.108 <0.1.0'
+        version: 0.0.108
 
 packages:
 
-  soulbridge@0.0.107:
-    resolution: {integrity: sha512-BCPOimzIt1+62JpsJR3qBO0TY9NFLc5Habea7oJx/kt5jo5XCZaOr1VGOT1PI6Tnjwz1wmhfhiSqr8W9VPCJ7A==}
+  soulbridge@0.0.108:
+    resolution: {integrity: sha512-xlO15ORXFbDhr1v3paE3yUbK62O5SNkszyW3513r+GvA6Suw4cCDT5/uJTY2YxXdDNjLgCrSeSZIisk8IW6j/g==}
     engines: {node: '>=22.18'}
     hasBin: true
 
 snapshots:
 
-  soulbridge@0.0.107: {}
+  soulbridge@0.0.108: {}

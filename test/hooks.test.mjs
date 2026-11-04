@@ -82,6 +82,21 @@ test.after(() => {
   }
 });
 
+test('hooks: an open question about a person reaches the block as one line', () => {
+  const bob = soul.rememberEntity('Bob', 'person');
+  store.putGap({
+    soulId: 'xiaoling',
+    userId: 'local',
+    aboutEntityId: bob.id,
+    topic: 'Bob 的工作定下来了吗',
+    tension: 0.6,
+    openedAt: Date.now(),
+  });
+  const hooks = buildFactHooks('Bob 最近怎么样');
+  assert.match(hooks.text, /<about name="Bob">/);
+  assert.match(hooks.text, /- 未闭合：Bob 的工作定下来了吗/);
+});
+
 test('mentions: a one-letter Latin name needs word boundaries', () => {
   const entity = { name: 'a', aliases: [] };
   assert.equal(mentions('chat 里那套 data 方案', entity), false, 'letters inside words must not match');

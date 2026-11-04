@@ -509,6 +509,11 @@ export function buildFactHooks(text, options = {}) {
         lines.push(`- ${marker}[${fact.id}] ${escapeBlockText(fact.statement)}${when ? `（${escapeBlockText(when)}）` : ''}`);
         used.push(fact.id);
       }
+      // The open questions about this person are what make the block actionable: without
+      // them the model sees history but cannot ask "how is she now".
+      for (const gap of ensureSoul().openGapsAbout(entity.id).slice(0, 2)) {
+        lines.push(`- 未闭合：${escapeBlockText(gap.topic)}`);
+      }
       if (lines.length > 0) {
         parts.push(`<about name="${escapeAttr(entity.name)}">\n${lines.join('\n')}\n</about>`);
       }
