@@ -1,2 +1,2 @@
 minimumReleaseAgeExclude:
-  - soulbridge@0.0.100 || 0.0.106
+  - soulbridge@0.0.100 || 0.0.106 || 0.0.107

@@ -884,6 +884,18 @@ export function createPreStepHandler(deps) {
       } catch (error) {
         log(`threads close failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+
+      // Housekeeping once per turn: an open question nobody answered in two weeks stopped
+      // being a question worth asking. No model call, one UPDATE.
+      try {
+        const swept = ensureSoul().sweep(Date.now(), { gapMaxAgeDays: 14 });
+        if (swept.gapsClosed > 0) {
+          log(`gaps closed: ${swept.gapsClosed} (expired)`);
+          trace({ event: 'gaps-expired', closed: swept.gapsClosed });
+        }
+      } catch (error) {
+        log(`gap sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const messages = Array.isArray(payload?.messages) ? payload.messages : [];
       const text = textOf(messages[messages.length - 1]?.content);
       if (text.length === 0) return decision;
