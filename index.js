@@ -663,7 +663,7 @@ export function buildFactHooks(text, options = {}) {
       for (const fact of [...earliest, ...recent]) {
         if (seen.has(fact.id)) continue;
         seen.add(fact.id);
-        const when = fact.atText ?? (fact.at ? new Date(fact.at).toISOString().slice(0, 10) : '');
+        const when = fact.validFromText ?? (fact.validFrom ? new Date(fact.validFrom).toISOString().slice(0, 10) : '');
         // ADR 0035: a fact from my side of the exchange is inferred. Two characters plus one
         // explanation below the block, because a per-line sentence would double the text.
         const marker = fact.source === 'inferred' ? INFERRED_MARKER : '';
@@ -810,7 +810,7 @@ function buildRelatedContext(text, state = {}) {
         const body = timeline
           .map(
             (fact) =>
-              `- [${fact.id}] ${fact.atText ? `${escapeBlockText(fact.atText)} ` : ''}${escapeBlockText(fact.statement)}`,
+              `- [${fact.id}] ${fact.validFromText ? `${escapeBlockText(fact.validFromText)} ` : ''}${escapeBlockText(fact.statement)}`,
           )
           .join('\n');
         parts.push(`<about-now name="${escapeAttr(plan.subject)}">\n${body}\n</about-now>`);
@@ -2106,7 +2106,7 @@ async function runConsolidationStep() {
   const batch = context.facts.slice(0, CONSOLIDATION_MAX_FACTS).map((fact) => ({
     id: fact.id,
     statement: fact.statement,
-    atText: fact.atText,
+    validFromText: fact.validFromText,
   }));
   let raw;
   try {
@@ -2351,8 +2351,9 @@ function detailTool() {
         properties: {
           ok: { type: 'boolean' },
           statement: { type: 'string' },
-          at: { type: 'number' },
-          atText: { type: 'string' },
+          validFrom: { type: 'number' },
+          validFromText: { type: 'string' },
+          validTo: { type: 'number' },
           userText: { type: 'string' },
           assistantText: { type: 'string' },
           reason: { type: 'string' },
@@ -2373,8 +2374,9 @@ function detailTool() {
         return {
           ok: true,
           statement: detail.fact.statement,
-          at: detail.fact.at,
-          atText: detail.fact.atText,
+          validFrom: detail.fact.validFrom,
+          validFromText: detail.fact.validFromText,
+          validTo: detail.fact.validTo,
           userText: detail.turn?.userText,
           assistantText: detail.turn?.assistantText,
         };
