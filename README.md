@@ -107,8 +107,17 @@ DSH 启动器对 `package.json` 直接 `JSON.parse`，不剥 BOM。用 Windows P
 
 计数来源是宿主的事件流：`step/start`（一次调用）、`assistant/attempt`（重试且没出消息）、
 `assistant/message.usage`（token）。子代理跑在自己的会话里，因此各自一条记录——事件流
-里没有父子关系，猜一个比写两条更坏。插件**不算钱**：金额只从 `scripts/billing.mjs`
-（读平台导出）来，价目有峰谷两档且会变。
+里没有父子关系，猜一个比写两条更坏。
+
+插件**不算钱**（价目有峰谷两档且会变）。账单是另一件事，也只属于宿主侧的运维：
+
+```powershell
+node scripts/billing.mjs --days 4   # 读平台导出，按天给金额/请求/三类 token 并复核单价
+```
+
+判读与限制见 [docs/cost-visibility.md](docs/cost-visibility.md)。这两样都**不属于 soulbridge**：
+记忆层存"发生了什么"，不记"值多少钱"。
+
 ## 升级提示：新增工具需要新开会话
 
 `ctx.inject(['tools'])` 注册的工具在**会话创建时**进入该会话的工具集。插件升级后
