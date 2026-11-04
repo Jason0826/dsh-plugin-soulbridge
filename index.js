@@ -694,11 +694,16 @@ export function buildFactHooks(text, options = {}) {
  * When the question names a subject, the entity timeline is the answer and the
  * related-pairs search is the contamination: it is how "上次和 a 吃饭" ends up
  * answered with something about b. So the plan chooses one or the other.
+ *
+ * A time question is different: the window block answers "what happened last week",
+ * and the relevance block stays on because it is where relative/unknown facts and
+ * not-yet-extracted conversation still surface (0027 §八: they must never be dropped
+ * just because their date cannot be located).
  */
 export function planBlocks(plan) {
-  if (!plan) return { related: true, timeline: false };
-  if (plan.primitive === 'entity') return { related: false, timeline: true };
-  return { related: true, timeline: false };
+  if (!plan) return { related: true, timeline: false, window: false };
+  if (plan.primitive === 'entity') return { related: false, timeline: true, window: false };
+  return { related: true, timeline: false, window: Boolean(plan.window) };
 }
 
 const PROFILE_CORE_DIMENSION = '价值观';
@@ -755,7 +760,52 @@ export function renderRulesBlock(rules) {
   return `<rules fired="${ids}">\n${lines}\n</rules>`;
 }
 
-function buildRelatedContext(text, state = {}) {
+/** How many facts one window may put in the prompt before it is cut. */
+const TIME_WINDOW_LIMIT = 10;
+
+/** A calendar day as the user reads it — local, not UTC: a date is a day, not an instant. */
+function isoDay(ms) {
+  const date = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** When a fact happened, as the injection may say it: a located date, or the words said. */
+function factWhen(fact) {
+  // A range ("10 月下旬") is not a day: printing its start as a date would claim an
+  // exactness the model never had. The original words are the honest answer.
+  if (fact.validFromPrecision === 'range' && fact.validFromText) return fact.validFromText;
+  return fact.validFrom ? isoDay(fact.validFrom) : fact.validFromText ?? '';
+}
+
+/**
+ * The facts that happened in one window (0027 §八, reader 1).
+ *
+ * Only located dates reach this block — the query already excluded the rest. The dates
+ * are shown because "when" is the question; an empty window says so explicitly rather
+ * than leaving the model to fill the gap. Truncation is stated, never silent: a block
+ * that looks complete but is not is worse than a short one.
+ */
+export function renderTimeWindow(window, facts, options = {}) {
+  const cue = escapeAttr(String(window.cue ?? ''));
+  // `to` is exclusive; the last day in the window is the millisecond before it.
+  const head = `<time-window cue="${cue}" from="${isoDay(window.from)}" to="${isoDay(window.to - 1)}">`;
+  if (!Array.isArray(facts) || facts.length === 0) {
+    return `${head}\n（${escapeBlockText(String(window.cue ?? '这段时间'))}没有记录）\n</time-window>`;
+  }
+  let sawInferred = false;
+  const lines = facts.map((fact) => {
+    const marker = fact.source === 'inferred' ? INFERRED_MARKER : '';
+    if (marker) sawInferred = true;
+    const when = escapeBlockText(String(factWhen(fact)));
+    return `- ${marker}[${fact.id}]${when ? ` ${when}` : ''} ${escapeBlockText(fact.statement)}`;
+  });
+  if (options.truncated) lines.push(`- （只显示最早 ${facts.length} 条）`);
+  const block = `${head}\n${lines.join('\n')}\n</time-window>`;
+  return sawInferred ? `${block}\n${SOURCE_NOTES}` : block;
+}
+
+export function buildRelatedContext(text, state = {}) {
   const parts = [];
   const used = [];
   // The profile is the merged description of the person; it is the only block that
@@ -822,6 +872,21 @@ function buildRelatedContext(text, state = {}) {
       }
     } catch (error) {
       log(`timeline failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (policy.window && plan?.window) {
+    try {
+      // +1 is a probe, not a fact: when it comes back there were more rows than the
+      // block may carry, and the renderer says so instead of pretending completeness.
+      const hits = ensureSoul().factsInWindow(plan.window, { limit: TIME_WINDOW_LIMIT + 1 });
+      const facts = hits.slice(0, TIME_WINDOW_LIMIT);
+      const truncated = hits.length > TIME_WINDOW_LIMIT;
+      parts.push(renderTimeWindow(plan.window, facts, { truncated }));
+      used.push(...facts.map((fact) => fact.id));
+      trace({ event: 'time_window', cue: plan.window.cue, from: plan.window.from, to: plan.window.to, hits: facts.length, truncated });
+      log(`time-window: ${plan.window.cue} hits=${facts.length}${truncated ? ' (truncated)' : ''}`);
+    } catch (error) {
+      log(`time window failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (policy.related) {
