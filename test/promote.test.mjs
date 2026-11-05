@@ -37,7 +37,10 @@ test('promote: extraction is what triggers it, and only on a corrected turn', as
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const drain = source.slice(source.indexOf('export async function drainExtractionQueue'));
   // Wiring matters: a promotion function nobody calls is the same empty queue as before.
-  assert.match(drain.slice(0, 3000), /feedClassifyFromTurn\(item\.turnId\)/);
+  // Window 4500 not 3000: the departure checklist and segment build now sit between the
+  // signature and the call (0028 ②). The literal `feedClassifyFromTurn(item.turnId)`
+  // exists nowhere else in the file, so widening keeps the assertion as tight.
+  assert.match(drain.slice(0, 4500), /feedClassifyFromTurn\(item\.turnId\)/);
 
   const feed = source.slice(source.indexOf('export function feedClassifyFromTurn'));
   const body = feed.slice(0, 1400);

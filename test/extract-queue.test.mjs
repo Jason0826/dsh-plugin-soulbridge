@@ -50,19 +50,6 @@ test('extract queue: an item remembers where it came from', () => {
   assert.equal(queue[1].origin, 'backfill', '回填必须可区分，否则会污染实验样本');
 });
 
-test('extract queue: live work is picked before history, whatever the order', () => {
-  // FIFO alone would put backfill items first: the queue is filled oldest-first, and a
-  // live turn appended later would wait behind every historical turn.
-  const queue = [
-    { turnId: 'b1', origin: 'backfill' },
-    { turnId: 'b2', origin: 'backfill' },
-    { turnId: 'l1', origin: 'live' },
-  ];
-  assert.equal(mod.pickExtractionItem(queue).turnId, 'l1');
-  assert.equal(mod.pickExtractionItem([{ turnId: 'b1', origin: 'backfill' }]).turnId, 'b1', '没有实时活时才做历史');
-  assert.equal(mod.pickExtractionItem([]), null);
-});
-
 test('extract queue: a backfill backlog never starves consolidation', () => {
   const backfillOnly = [{ turnId: 'b1', origin: 'backfill' }];
   // With history waiting and a closed thread to understand, consolidation goes first.

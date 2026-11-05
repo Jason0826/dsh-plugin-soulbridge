@@ -1116,6 +1116,12 @@ export function createPreStepHandler(deps) {
     const decision = await next();
     try {
       if (decision?.kind !== 'enter') return decision;
+      // Hoisted before the chain starts: its stage closures run synchronously inside
+      // runStageChain, so reading these afterwards would hit the temporal dead zone.
+      // `sessionId` is what the departure checklist compares buffered turns against
+      // (0028); `archivedSessions` is the same host set closeIdleThreads uses below.
+      const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
+      const archivedSessions = deps.archivedSessions?.() ?? [];
       // We are inside a live turn now, which is the only place the host model is
       // callable. Stages run in priority order and a stage that skipped its work
       // must not claim the call — that is how the classifier starved for an hour.
@@ -1141,9 +1147,12 @@ export function createPreStepHandler(deps) {
             // Live conversation before everything; understanding before the backfill.
             // Fixed priority (extract always first) plus a long backfill is a starvation
             // bug, not a preference: 29 closed threads waited while the backfill drained.
-            if (extractRunsFirst(extractQueue, consolidationPending)) stages.push(drainExtractionQueue);
+            // The drain carries the departure context: it flushes a segment only when
+            // these say something left the window (0028 决定 2), and waits otherwise.
+            const drainSegment = () => drainExtractionQueue({ sessionId, archivedSessions });
+            if (extractRunsFirst(extractQueue, consolidationPending)) stages.push(drainSegment);
             stages.push(runConsolidationStep);
-            stages.push(drainExtractionQueue);
+            stages.push(drainSegment);
             if (profilePending && stageTick % 2 === 0) stages.push(runProfileStep);
             stages.push(runClassifyStep);
             if (profilePending && stageTick % 2 === 1) stages.push(runProfileStep);
@@ -1175,7 +1184,6 @@ export function createPreStepHandler(deps) {
       // Topics the conversation has moved past, closed once per turn. Counting
       // actual turns — the host's turn numbers jump by 10–30 per exchange, so a
       // numeric difference closed a topic one message after it opened.
-      const sessionId = payload?.agent?.id ?? payload?.agent?.session?.id ?? 'default';
       try {
         const closeConfig = readConfig();
         const closed = ensureSoul().closeIdleThreads(sessionId, {
@@ -1183,7 +1191,7 @@ export function createPreStepHandler(deps) {
           idleMs: (closeConfig.threadIdleMinutes ?? 30) * 60_000,
           // The host's own archive list: a session the user put away is finished
           // by declaration, so its topics close immediately.
-          archivedSessionIds: deps.archivedSessions?.() ?? [],
+          archivedSessionIds: archivedSessions,
           at: Date.now(),
         });
         if (closed.length > 0) {
@@ -1352,6 +1360,17 @@ function flushTurnPair(sessionId) {
 const EXTRACT_QUEUE_FILE = join(HOME, 'pending-extract.json');
 const EXTRACT_MAX_ATTEMPTS = 3;
 
+/* 0028 决定 2: the departure checklist, declared once (rule 6).
+ * The two size bounds and the age bound are ENGINEERING fallbacks — they flush a
+ * buffer that would otherwise dangle, never a claim that a topic ended. All three
+ * are test inputs to planSegment, not scattered literals. */
+export const SEGMENT_MAX_TURNS = 40;
+export const SEGMENT_MAX_CHARS = 60_000;
+export const SEGMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SEGMENT_STATE_FILE = join(HOME, 'segment-state.json');
+/** Seals are a marker, not work: the newest N prove "extracted at most once". */
+const SEGMENT_SEAL_CAP = 100;
+
 /**
  * Read a queue file.
  *
@@ -1422,14 +1441,146 @@ function bumpExtractAttempt(turnId) {
 }
 
 /**
- * After a thread was extracted, every queued turn of that thread is already covered.
- * Leaving them would extract the same topic again, turn by turn (0025).
+ * Remove a whole segment's items by identity, computed from a fresh read.
+ *
+ * A segment is one extraction unit (0028): its turns leave the queue together or
+ * stay together, so the id list is the handle — a thread id no longer is, because
+ * attribution is an output of the extraction, not an input to it.
  */
-function removeExtractItemsOfThread(threadId, turnIds) {
-  if (!threadId) return;
-  writeExtractQueue(
-    readExtractQueue().filter((item) => !turnIds.includes(item.turnId)),
-  );
+function removeExtractItems(turnIds) {
+  const ids = new Set(turnIds);
+  writeExtractQueue(readExtractQueue().filter((item) => !ids.has(item.turnId)));
+}
+
+/* ------------------------------------------------------------------ *
+ * Segments (0028): what left the context, and what was already flushed
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read the segment state: the departure marker and the seal records.
+ *
+ * An unreadable file is not an empty one (same rule as the queue files): it is
+ * set aside with its bytes intact, because losing every seal record would let
+ * already-extracted turns be enqueued again with nothing to say so.
+ */
+function readSegmentState() {
+  try {
+    const raw = JSON.parse(readFileSync(SEGMENT_STATE_FILE, 'utf8'));
+    return {
+      marker: raw?.marker ?? null,
+      sealed: Array.isArray(raw?.sealed) ? raw.sealed : [],
+    };
+  } catch (error) {
+    if (existsSync(SEGMENT_STATE_FILE)) {
+      log(`segment state unreadable, setting it aside: ${error instanceof Error ? error.message : String(error)}`);
+      try {
+        renameSync(SEGMENT_STATE_FILE, `${SEGMENT_STATE_FILE}.corrupt-${Date.now()}`);
+      } catch {
+        /* the log above is the record */
+      }
+    }
+    return { marker: null, sealed: [] };
+  }
+}
+
+function writeSegmentState(state) {
+  try {
+    const sealed = Array.isArray(state.sealed) ? state.sealed : [];
+    const kept = sealed.slice(-SEGMENT_SEAL_CAP);
+    const dropped = sealed.length - kept.length;
+    // A cap drop is visible like every other cap (rule 15/18), even though seals
+    // are markers rather than pending work.
+    if (dropped > 0) log(`segment seals over cap: wrote ${kept.length}, dropped ${dropped}`);
+    writeFileSync(
+      SEGMENT_STATE_FILE,
+      JSON.stringify({ marker: state.marker ?? null, sealed: kept }, null, 2),
+      'utf8',
+    );
+  } catch (error) {
+    log(`segment state write failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * The host said "this left the window" (0028 决定 2): set the marker and stop.
+ *
+ * Compression, session switch and archive only ever leave marks — no model call
+ * happens on an event, because the host model is callable inside a step only.
+ * The next drain reads the marker and flushes what it covers.
+ */
+function setSegmentMarker(marker) {
+  const state = readSegmentState();
+  writeSegmentState({ ...state, marker });
+  log(`segment marker: trigger=${marker.trigger} session=${marker.session ?? '-'} at=${marker.at}`);
+  trace({ event: 'segment-marker', ...marker });
+}
+
+/**
+ * Record that a segment was flushed: the marker is spent, the seal list grows.
+ *
+ * The seal is the queryable half of declaration 1 ("a sealed segment is not
+ * extracted twice"): removing the items makes a re-run unlikely, the record makes
+ * the claim checkable — and lets enqueueExtraction refuse a re-queue.
+ */
+function sealSegment({ trigger, turnIds, turns, chars, outcome, session }) {
+  const state = readSegmentState();
+  writeSegmentState({
+    marker: null,
+    sealed: [
+      ...state.sealed,
+      { at: Date.now(), trigger, session: session ?? null, turns, chars, outcome, turnIds },
+    ],
+  });
+  trace({ event: 'segment-seal', trigger, turns, chars, outcome, session: session ?? null });
+}
+
+/**
+ * The departure checklist (0028 决定 2): which buffered turns to flush, and why.
+ *
+ * Pure on purpose — entries, marker, archive set and clock are arguments, so the
+ * trigger table in the brief is a test table (rule 26). Two kinds of answer:
+ *
+ *   - a semantic departure: the first CONTIGUOUS run that has left the context
+ *     (its session is not the current one, or it predates the compaction marker).
+ *     Contiguity keeps the run a stretch of conversation; taking the first run
+ *     means a backfill batch appended behind live turns is not stranded behind
+ *     them — live turns wait for their own departure, history flushes on its own.
+ *   - an engineering fallback over the WHOLE buffer: over the size cap or older
+ *     than a day. These flush what would otherwise dangle; they never assert a
+ *     topic boundary (quiet-time: a time signal is only ever a fallback).
+ *
+ * Returns `{ entries, trigger }`; `trigger: null` means nothing has left yet.
+ */
+export function planSegment(entries, env = {}) {
+  const {
+    currentSessionId,
+    markerAt = null,
+    archived = false,
+    now = Date.now(),
+    maxTurns = SEGMENT_MAX_TURNS,
+    maxChars = SEGMENT_MAX_CHARS,
+    maxAgeMs = SEGMENT_MAX_AGE_MS,
+  } = env;
+  if (!Array.isArray(entries) || entries.length === 0) return { entries: [], trigger: null };
+  // Archiving is the user declaring the session finished: everything buffered goes.
+  if (archived) return { entries, trigger: 'archived' };
+  const departed = (entry) => {
+    if (currentSessionId && entry.sessionId && entry.sessionId !== currentSessionId) return 'session';
+    if (markerAt !== null && entry.startedAt <= markerAt) return 'compaction';
+    return null;
+  };
+  const start = entries.findIndex((entry) => departed(entry) !== null);
+  if (start >= 0) {
+    let end = start;
+    while (end < entries.length && departed(entries[end]) !== null) end += 1;
+    const run = entries.slice(start, end);
+    return { entries: run, trigger: departed(run[0]) };
+  }
+  const chars = entries.reduce((sum, entry) => sum + (entry.chars ?? 0), 0);
+  if (entries.length >= maxTurns || chars >= maxChars) return { entries, trigger: 'capacity' };
+  const oldest = Math.min(...entries.map((entry) => entry.startedAt ?? now));
+  if (now - oldest > maxAgeMs) return { entries, trigger: 'age' };
+  return { entries: [], trigger: null };
 }
 
 /**
@@ -1443,12 +1594,19 @@ function removeExtractItemsOfThread(threadId, turnIds) {
 export function enqueueExtraction(turnId, turnNo, origin = 'live') {
   const queue = readExtractQueue();
   if (queue.some((item) => item.turnId === turnId)) return false;
+  // A sealed segment is not re-queued (0028 declaration 1): the seal record is
+  // what makes "extracted at most once" checkable instead of merely intended.
+  // Replays are the documented exception and carry origin=backfill.
+  if (origin !== 'backfill' && readSegmentState().sealed.some((seg) => seg.turnIds.includes(turnId))) {
+    log(`extract buffered: turn=${turnNo} already sealed, refused (a replay needs origin=backfill)`);
+    return false;
+  }
   // `origin` separates live turns from a historical backfill. Without it the attribution
   // experiment counts re-extracted old turns as fresh evidence, and a verdict about the
   // new default-continue rule would be read off history that never saw that rule.
   queue.push({ turnId, turnNo, attempts: 0, origin });
   writeExtractQueue(queue);
-  log(`extract queued turn=${turnNo} origin=${origin} pending=${queue.length} file=${EXTRACT_QUEUE_FILE}`);
+  log(`extract buffered turn=${turnNo} origin=${origin} pending=${queue.length} file=${EXTRACT_QUEUE_FILE}`);
   return true;
 }
 
@@ -1465,11 +1623,25 @@ function hasSubstance(text) {
   return !/^(好的?|嗯+|哦+|可以|行|ok|okay|收到|明白|继续|好)[。！!.\s]*$/i.test(trimmed);
 }
 
-async function runExtraction(text, turnId, turnNo, origin = 'live', thread = null) {
+/**
+ * Extract one unit: a segment (0028), or a single message when there is no segment.
+ *
+ * `unit` carries the prompt-numbered turns; the attribution the model returns is
+ * a product of this call, never an input to it (决定 3). `turnId`/`turnNo` are the
+ * segment HEAD — the continuity point before the unit — and the fallback source
+ * for facts the model did not number.
+ */
+async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null) {
   const config = readConfig();
   if (config.extract === 'off') return 'skipped-off';
-  if (typeof text !== 'string' || !hasSubstance(text)) {
-    log(`extract skipped: no substance (chars=${typeof text === 'string' ? text.length : -1}) turn=${turnNo}`);
+  // The unit decides, not its last message: a segment whose final turn is "好的"
+  // still holds every turn above it, and taking the unit or none of it is rule 17.
+  const unitTexts = unit?.turns?.length ? unit.turns.map((entry) => entry.userText) : [text];
+  if (typeof text !== 'string' || !unitTexts.some((entry) => typeof entry === 'string' && hasSubstance(entry))) {
+    log(
+      `extract skipped: no substance (chars=${unitTexts.reduce((n, entry) => n + (typeof entry === 'string' ? entry.length : 0), 0)})` +
+        ` unit=${unitTexts.length} turn=${turnNo}`,
+    );
     return 'skipped-empty';
   }
   const started = Date.now();
@@ -1487,9 +1659,10 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
       const previousThreadId = soul.threadBefore(turnRow.sessionId, turnNo);
       if (previousThreadId) context.previousThreadId = previousThreadId;
     }
-    // 0025: the unit is the whole topic when the turn belongs to one. The turns array is
-    // numbered the way the prompt numbers them, and each fact may name its own turn.
-    const turns = thread?.turns ?? null;
+    // 0028: the unit is the segment a departure flushed. The turns array is
+    // numbered the way the prompt numbers them (1..n inside the unit), and each
+    // fact may name its own turn — turnIds maps that number back to the real turn.
+    const turns = unit?.turns ?? null;
     const turnIds = turns ? Object.fromEntries(turns.map((entry) => [entry.turnNo, entry.id])) : undefined;
     const draft = await soul.extract(text, {
       llm: useLlm ? injectedLlm : undefined,
@@ -1524,7 +1697,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
         ` gaps=${result.gaps.length} skipped=${result.skipped.length} draftSkipped=${(draft.skipped ?? []).length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +
-        ` unit=${turns ? `${turns.length}turns` : '1turn'} threadId=${thread?.id ?? '-'}` +
+        ` unit=${turns ? `${turns.length}turns` : '1turn'}` +
         ` ms=${ms} turn=${turnNo} origin=${origin}` +
         ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
         ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
@@ -1573,22 +1746,16 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
 }
 
 let draining = false;
+/**
+ * The buffered size last reported as a wait (0028 declaration 5 observability).
+ * Reset on every flush so the next wait always logs; between flushes it keeps the
+ * trace to one line per buffer change instead of one per step.
+ */
+let lastSegmentWait = -1;
 /** True while a stage chain is running, so two chains never overlap. */
 let stageChainBusy = false;
 /** Alternates the profile merge with the rest of the chain so it cannot be starved. */
 let stageTick = 0;
-
-/**
- * Which queued turn to extract next.
- *
- * Live turns first, then history: FIFO alone would put 20 backfill items ahead of the
- * conversation happening right now, so a live turn waits dozens of steps to be read.
- */
-export function pickExtractionItem(queue) {
-  // Live turns first, then history. FIFO alone would put 20 backfill items ahead of the
-  // conversation happening right now, so a live turn waits dozens of steps to be read.
-  return queue.find((item) => (item.origin ?? 'live') !== 'backfill') ?? queue[0] ?? null;
-}
 
 /**
  * Should extraction take this step before consolidation?
@@ -1604,18 +1771,21 @@ export function extractRunsFirst(extractQueue, consolidationPending) {
 }
 
 /**
- * Drain ONE queued turn per step.
+ * Flush ONE segment per step — the whole unit, and only at a departure (0028).
  *
- * The host model is only callable inside the current step: of three serial
- * calls in one drain, the middle one succeeded and the other two failed with the
- * stream gone. One item per step keeps every attempt inside that window; the
- * queue is a backlog, not a batch.
+ * The host model is only callable inside the current step, so at most one model
+ * call happens here. What makes it happen is not "the queue is non-empty" but the
+ * departure checklist (planSegment): compaction marker, session switch/archive,
+ * capacity, age. With none of them the queue only waits — in-session extraction
+ * is 0 by construction, because those turns are still in the host's context and
+ * extracting them again is the duplicate work 0028 exists to stop.
  *
- * A model failure keeps the item, because the rules pass is only a floor: if it
- * counted as done, that turn would never get a model extraction. Three failures
- * drop it with the reason.
+ * A model failure keeps the WHOLE segment: one call covered it, so its items are
+ * bumped together and share one attempt count. Three failures seal and drop the
+ * segment with its size (rule 15) — sealed, so a later backfill cannot re-queue
+ * what already failed three times.
  */
-export async function drainExtractionQueue() {
+export async function drainExtractionQueue(options = {}) {
   if (draining) return false;
   const config = readConfig();
   if (config.extract === 'off') return false;
@@ -1623,63 +1793,110 @@ export async function drainExtractionQueue() {
   if (queue.length === 0) return false;
   draining = true;
   try {
-    const item = pickExtractionItem(queue);
-    let text = '';
-    let thread = null;
+    // Rows are the source of truth (rule 16): which session a turn belongs to and
+    // when it happened come from `turns`, not from a copy in the queue file. A
+    // failed read keeps the queue — a store error is not an empty result (rule 11).
+    let entries;
     try {
       const soul = ensureSoul();
-      const turn = soul.turn(item.turnId);
-      text = turn?.userText ?? '';
-      // A turn is a trigger, the topic is the unit (0025). When the turn is already in a
-      // thread, extract that thread's turns instead of this message alone.
-      const threadId = soul.turnThreadId(item.turnId);
-      if (threadId) {
-        const turns = soul.threadTurns(threadId);
-        if (turns.length > 0) {
-          thread = { id: threadId, turns };
-          text = turns[turns.length - 1].userText;
+      entries = [];
+      for (const item of queue) {
+        const row = soul.turn(item.turnId);
+        if (!row) {
+          log(`extract queue: turn ${item.turnId} missing, dropped`);
+          removeExtractItem(item.turnId);
+          continue;
         }
+        entries.push({
+          item,
+          row,
+          sessionId: row.sessionId,
+          startedAt: row.at,
+          chars: row.userText.length + row.assistantText.length,
+        });
       }
-    } catch {
-      text = '';
+    } catch (error) {
+      log(`segment resolve failed (queue kept): ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
-    if (!text) {
-      log(`extract queue: turn ${item.turnId} missing, dropped`);
-      removeExtractItem(item.turnId);
-      return;
+    if (entries.length === 0) return false;
+    const state = readSegmentState();
+    const plan = planSegment(entries, {
+      currentSessionId: options.sessionId,
+      markerAt: state.marker?.at ?? null,
+      archived: Boolean(options.sessionId && (options.archivedSessions ?? []).includes(options.sessionId)),
+      now: Date.now(),
+    });
+    if (!plan.trigger) {
+      // A marker whose covered turns are all gone can never fire again (time only
+      // moves forward); leaving it would look like a pending departure forever.
+      if (state.marker) {
+        writeSegmentState({ ...state, marker: null });
+        log(`segment marker: nothing left to flush (at=${state.marker.at}), cleared`);
+      }
+      // One wait line per buffer change, not per step: the queue's own backlog log
+      // covers writes, this one makes declaration 5 (no departure = no extraction)
+      // observable in production.
+      if (entries.length !== lastSegmentWait) {
+        lastSegmentWait = entries.length;
+        trace({ event: 'segment-wait', buffered: entries.length, session: options.sessionId ?? null });
+      }
+      return false;
     }
-
-    const outcome = await runExtraction(text, item.turnId, item.turnNo, item.origin ?? 'live', thread);
+    const taken = plan.entries;
+    const head = taken[0];
+    const last = taken[taken.length - 1];
+    const chars = taken.reduce((sum, entry) => sum + entry.chars, 0);
+    // Prompt numbering is 1..n inside the unit; turnIds maps it back to the real
+    // turn, so a fact's 轮次 lands on source_turn_id.
+    const turns = taken.map((entry, index) => ({
+      id: entry.item.turnId,
+      turnNo: index + 1,
+      userText: entry.row.userText,
+      assistantText: entry.row.assistantText,
+      startedAt: entry.row.at,
+    }));
+    const origin = taken.every((entry) => (entry.item.origin ?? 'live') === 'backfill') ? 'backfill' : 'live';
+    log(
+      `segment flush: trigger=${plan.trigger} turns=${turns.length} chars=${chars}` +
+        ` head=${head.item.turnNo} origin=${origin}`,
+    );
+    const outcome = await runExtraction(last.row.userText, head.item.turnId, head.item.turnNo, origin, { turns });
     const ok =
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
-      if (thread) {
-        removeExtractItemsOfThread(thread.id, thread.turns.map((entry) => entry.id));
-        // Promotion is decided after the facts exist; a whole thread can hold several
-        // corrected turns, so every turn is offered.
-        for (const entry of thread.turns) feedClassifyFromTurn(entry.id);
-      } else {
-        removeExtractItem(item.turnId);
-        // Promotion is decided after the facts exist: a corrected turn's lessons enter
-        // the classification queue here, which is the only live producer it has.
-        feedClassifyFromTurn(item.turnId);
-      }
-      trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome });
+      // Promotion is decided after the facts exist: a corrected turn's lessons enter
+      // the classification queue here, which is the only live producer it has.
+      for (const { item } of taken) feedClassifyFromTurn(item.turnId);
+      removeExtractItems(taken.map((entry) => entry.item.turnId));
+      sealSegment({
+        trigger: plan.trigger,
+        turnIds: taken.map((entry) => entry.item.turnId),
+        turns: taken.length,
+        chars,
+        outcome,
+        session: head.sessionId,
+      });
+      lastSegmentWait = -1;
+      trace({ event: 'extract-queue', drained: taken.length, remaining: readExtractQueue().length, outcome, trigger: plan.trigger });
       return true;
     }
 
     // A rules result caused by a broken model call is not a completed extraction.
-    const attempts = (item.attempts ?? 0) + 1;
+    const attempts = (head.item.attempts ?? 0) + 1;
+    const turnIds = taken.map((entry) => entry.item.turnId);
     if (attempts >= EXTRACT_MAX_ATTEMPTS) {
-      log(`extract queue: giving up on turn=${item.turnNo} after ${attempts}: ${outcome}`);
-      removeExtractItem(item.turnId);
+      log(`extract queue: giving up on segment trigger=${plan.trigger} turns=${taken.length} after ${attempts}: ${outcome}`);
+      removeExtractItems(turnIds);
+      sealSegment({ trigger: plan.trigger, turnIds, turns: taken.length, chars, outcome: `given-up:${outcome}`, session: head.sessionId });
+      trace({ event: 'extract-queue', drained: taken.length, remaining: readExtractQueue().length, outcome, dropped: true, trigger: plan.trigger });
       return true;
     }
-    log(`extract queue: retry turn=${item.turnNo} attempt=${attempts} (${outcome})`);
     // Bump in place, computed from a fresh read: an item enqueued during the model
     // call must not be overwritten by a stale queue snapshot.
-    bumpExtractAttempt(item.turnId);
-    trace({ event: 'extract-queue', drained: 1, remaining: readExtractQueue().length, outcome, retry: true });
+    for (const { item } of taken) bumpExtractAttempt(item.turnId);
+    log(`extract queue: retry segment trigger=${plan.trigger} attempt=${attempts} turns=${taken.length} (${outcome})`);
+    trace({ event: 'extract-queue', drained: taken.length, remaining: readExtractQueue().length, outcome, retry: true, trigger: plan.trigger });
     return true;
   } finally {
     draining = false;
@@ -2755,6 +2972,25 @@ export function apply(ctx) {
       // silence timer and the next user turn are fallbacks only.
       if (type === 'turn/end') {
         flushTurnPair(sessionId);
+        return;
+      }
+
+      // 0028 决定 2: compaction is the host saying "this left the window". A marker
+      // only — events never call the model (it is callable inside a step), and the
+      // next drain flushes what the marker covers. An errored compaction changed
+      // nothing, so it must leave no marker: a false departure would write durable
+      // memory for content that is still in the context.
+      if (type === 'compaction/end') {
+        if (event.data?.error) {
+          log(`segment marker: compaction failed (${event.data.error}), window unchanged`);
+        } else {
+          setSegmentMarker({
+            trigger: 'compaction',
+            session: sessionId,
+            at: Date.now(),
+            compactionId: event.data?.compactionId ?? null,
+          });
+        }
         return;
       }
 
