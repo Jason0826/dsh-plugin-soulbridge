@@ -763,11 +763,14 @@ export function renderRulesBlock(rules) {
 /** How many facts one window may put in the prompt before it is cut. */
 const TIME_WINDOW_LIMIT = 10;
 
-/** A calendar day as the user reads it — local, not UTC: a date is a day, not an instant. */
+/**
+ * A calendar day in the unit the store writes: the UTC date of a day instant.
+ *
+ * Not the local date: facts store days as UTC midnights, so the local reading would
+ * disagree in any timezone west of UTC — and agree only by luck in ours.
+ */
 function isoDay(ms) {
-  const date = new Date(ms);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 /** When a fact happened, as the injection may say it: a located date, or the words said. */

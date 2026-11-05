@@ -22,7 +22,10 @@ const store = openSqlite(join(home, 'soul.db'));
 const soul = new Soul({ store, soulId: 'xiaoling', userId: 'local' });
 
 test('renderTimeWindow: a day is shown as its date, a range as the words that were said', () => {
-  const window = { from: new Date(2026, 9, 26).getTime(), to: new Date(2026, 10, 2).getTime(), cue: '上周' };
+  // Boundaries are calendar-day instants (UTC midnight) — the unit the store writes
+  // and the unit isoDay renders. Local-midnight boundaries would agree only by luck
+  // of the timezone.
+  const window = { from: Date.UTC(2026, 9, 26), to: Date.UTC(2026, 10, 2), cue: '上周' };
   const text = renderTimeWindow(window, [
     {
       id: 'fc_1',
@@ -34,7 +37,7 @@ test('renderTimeWindow: a day is shown as its date, a range as the words that we
     {
       id: 'fc_2',
       statement: '小林在找工作',
-      validFrom: new Date(2026, 9, 27).getTime(),
+      validFrom: Date.UTC(2026, 9, 27),
       validFromPrecision: 'range',
       validFromText: '10 月下旬',
       source: 'told',
@@ -46,7 +49,10 @@ test('renderTimeWindow: a day is shown as its date, a range as the words that we
 });
 
 test('renderTimeWindow: an empty window says so, and content cannot close the block', () => {
-  const window = { from: new Date(2026, 9, 26).getTime(), to: new Date(2026, 10, 2).getTime(), cue: '上周' };
+  // Boundaries are calendar-day instants (UTC midnight) — the unit the store writes
+  // and the unit isoDay renders. Local-midnight boundaries would agree only by luck
+  // of the timezone.
+  const window = { from: Date.UTC(2026, 9, 26), to: Date.UTC(2026, 10, 2), cue: '上周' };
   const empty = renderTimeWindow(window, []);
   assert.match(empty, /没有记录/, 'silence would let the model fill the gap');
   const forged = renderTimeWindow(window, [
