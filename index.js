@@ -1053,42 +1053,64 @@ export async function runStageChain(stages) {
   return false;
 }
 
+/**
+ * The handoff consumer: at most one NON-EMPTY block per session.
+ *
+ * Deliberately once per session and only when the topic belongs to a
+ * different session — repeating it every turn would make it wallpaper, and
+ * re-reading the previous session's own topic is not a handoff.
+ *
+ * The read is injected so tests can drive the consumption contract without a
+ * database. An EMPTY read does NOT consume the slot: a new session's first
+ * turn often reads empty because the previous segment has not been flushed
+ * yet (0028 decision 4 — handoff is a render, not a one-shot trigger), and
+ * forfeiting then would drop the one chance this session has to be told where
+ * it came from. A throwing read also leaves the slot open, as before.
+ */
+export function createHandoffTaker(readShot, logger, tracer) {
+  /** Sessions that already received a non-empty handoff block. */
+  const handedOff = new Set();
+  return (sessionId) => {
+    if (handedOff.has(sessionId)) return '';
+    try {
+      const shot = readShot(sessionId);
+      if (shot.block) {
+        handedOff.add(sessionId);
+        logger(`handoff: "${shot.topic}" summary=${shot.summary ? 'yes' : 'no'}`);
+        tracer({
+          event: 'handoff',
+          thread: shot.thread,
+          theme: shot.topic,
+          hasSummary: shot.summary,
+        });
+      }
+      return shot.block;
+    } catch (error) {
+      logger(`handoff failed (will retry next turn): ${error instanceof Error ? error.message : String(error)}`);
+      return '';
+    }
+  };
+}
+
 export function createPreStepHandler(deps) {
   /** sessionId -> last turn that received an injection */
   const injectedTurn = new Map();
-  /** Sessions that already got the handoff block once. */
-  const handedOff = new Set();
 
-  /**
-   * The "where were we" block: the last topic that finished.
-   *
-   * Deliberately once per session and only when that topic belongs to a
-   * different session — repeating it every turn would make it wallpaper, and
-   * re-reading the previous session's own topic is not a handoff.
-   */
-  function takeHandoff(sessionId) {
-    if (handedOff.has(sessionId)) return '';
-    try {
+  // "Where were we": one non-empty block per session, retried until it ships.
+  // The reader goes through ensureSoul() so the live store is read at call time.
+  const takeHandoff = createHandoffTaker(
+    (sessionId) => {
       const last = ensureSoul().lastClosedThread();
-      const block = renderHandoff(last, sessionId);
-      // Only mark it once the read succeeded: a transient failure on the first turn
-      // used to exclude the session from handoff forever.
-      handedOff.add(sessionId);
-      if (block) {
-        log(`handoff: "${last.thread.topic}" summary=${last.conclusion ? 'yes' : 'no'}`);
-        trace({
-          event: 'handoff',
-          thread: last.thread.id,
-          theme: last.thread.topic,
-          hasSummary: Boolean(last.conclusion),
-        });
-      }
-      return block;
-    } catch (error) {
-      log(`handoff failed (will retry next turn): ${error instanceof Error ? error.message : String(error)}`);
-      return '';
-    }
-  }
+      return {
+        block: renderHandoff(last, sessionId),
+        thread: last?.thread?.id,
+        topic: last?.thread?.topic,
+        summary: Boolean(last?.conclusion),
+      };
+    },
+    log,
+    trace,
+  );
 
   return async (payload, next) => {
     const decision = await next();
@@ -1495,8 +1517,10 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
     // Provenance is observable (ADR 0035): the fact count alone cannot tell whether
     // anything came from my side of the exchange.
     const inferred = result.facts.filter((fact) => fact.source === 'inferred').length;
+    // "done", not "ok": the caller decides the queue outcome next (rules:model-failed
+    // is NOT ok), and the old prefix read as success in every log review.
     log(
-      `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
+      `extract done: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
         ` gaps=${result.gaps.length} skipped=${result.skipped.length} draftSkipped=${(draft.skipped ?? []).length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +

@@ -2,10 +2,15 @@
  * The handoff block is the answer to "where were we", and the design says that
  * means the last *topic* that finished — not the previous session, which can hold
  * several topics or none.
+ *
+ * The consumption contract (0028 decision 4: handoff is a render, not a
+ * one-shot trigger): a session gets at most ONE non-empty block, and only a
+ * non-empty read consumes it — the first turn may read empty because the
+ * previous segment has not been flushed yet.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderHandoff } from '../index.js';
+import { renderHandoff, createHandoffTaker } from '../index.js';
 
 const sample = {
   thread: { id: 'th_a', sessionId: 'session-old', topic: '记忆如何影响行为', closedAt: Date.parse('2026-11-02T00:30:00Z') },
@@ -64,4 +69,40 @@ test('handoff: user words go in whole — no prefix cuts', () => {
   assert.ok(block.includes(longUser), '整句都在');
   assert.ok(block.includes(longUser.slice(-6)), '结尾没有被切掉');
   assert.match(block, /topic="一个相当长的主题标题用在交接块里也应该完整出现"/);
+});
+
+test('handoff: an empty first read does not consume the session (0028 §4)', () => {
+  const shots = [
+    { block: '' },
+    { block: '<handoff topic="上一段" closed="2026-11-05"></handoff>', topic: '上一段', thread: 'th_x', summary: true },
+  ];
+  const take = createHandoffTaker(() => shots.shift() ?? { block: '' }, () => {}, () => {});
+  assert.equal(take('s1'), '', '第 1 轮可能读空（上一段还没抽完）');
+  assert.match(take('s1'), /<handoff/, '空读不许消费：拿到后仍要发');
+  assert.equal(take('s1'), '', '发过一次就封口——每会话至多一条非空');
+});
+
+test('handoff: a throwing read is retried, never forfeited', () => {
+  let calls = 0;
+  const take = createHandoffTaker(
+    () => {
+      if (calls++ === 0) throw new Error('db busy');
+      return { block: '<handoff topic="t" closed="2026-11-05"></handoff>', topic: 't', thread: 'th', summary: false };
+    },
+    () => {},
+    () => {},
+  );
+  assert.equal(take('s1'), '');
+  assert.match(take('s1'), /<handoff/, '瞬时失败下一轮重试');
+});
+
+test('handoff: separate sessions do not share the one-shot state', () => {
+  const take = createHandoffTaker(
+    () => ({ block: '<handoff topic="永远有" closed="2026-11-05"></handoff>', topic: '永远有', thread: 'th', summary: false }),
+    () => {},
+    () => {},
+  );
+  assert.match(take('s2'), /<handoff/);
+  assert.equal(take('s2'), '');
+  assert.match(take('s3'), /<handoff/, '每个会话各一次');
 });
