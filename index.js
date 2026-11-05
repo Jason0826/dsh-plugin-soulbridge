@@ -1677,15 +1677,30 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
     });
     const result = soul.commitDrafts(draft, { turnId, turnIds });
     // Attribution is written even when nothing was extracted: a turn that says
-    // "无" (nothing worth remembering) can still be part of a thread.
-    const attribution = soul.applyThread(draft.thread, {
+    // "无" (nothing worth remembering) can still be part of a thread. The unit is
+    // fanned over per turn (0028 ③): every turn of the segment gets attached, a
+    // turn no span covers chains to the previous one, and the continue/new/
+    // fallback chain inside applyThread is untouched (ADR 0034).
+    const spanTurns = (turns ?? [{ turnNo: 1, id: turnId, userText: text }]).map((entry) => ({
+      promptNo: entry.turnNo,
+      turnNo: entry.hostTurnNo ?? turnNo,
+      turnId: entry.id,
+      at: entry.startedAt ?? Date.now(),
+      fallbackTopic: firstSentence(entry.userText ?? text),
+    }));
+    const applied = soul.applyThreadSpans(draft.spans, {
       sessionId: turnRow?.sessionId ?? 'unknown',
-      turnNo,
-      turnId,
-      at: Date.now(),
-      fallbackTopic: firstSentence(text),
+      turns: spanTurns,
       previousThreadId: context.previousThreadId,
     });
+    const attribution = applied[0];
+    // One thread keeps the old line's thread part byte for byte (`thread=th_xxx(new)`);
+    // a split segment lists every thread it produced, and `join=` is the unit's
+    // per-turn reasons joined with `+` (one value only when they agree) — the head
+    // alone no longer describes what the rest of the segment did.
+    const threadIds = [...new Set(applied.map((entry) => entry.threadId))];
+    const createdNew = applied.filter((entry) => entry.created).length;
+    const joins = [...new Set(applied.map((entry) => entry.joinReason))].join('+');
     const ms = Date.now() - started;
     // Provenance is observable (ADR 0035): the fact count alone cannot tell whether
     // anything came from my side of the exchange.
@@ -1699,9 +1714,10 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
         ` inferred=${inferred}` +
         ` unit=${turns ? `${turns.length}turns` : '1turn'}` +
         ` ms=${ms} turn=${turnNo} origin=${origin}` +
-        ` thread=${attribution.threadId}${attribution.created ? '(new)' : ''}` +
-        ` join=${attribution.joinReason} threadLine=${draft.threadLine ?? 'rules'}` +
-        `${attribution.topicUpdated ? ' topic=updated' : ''}`,
+        ` thread=${threadIds.join(',')}` +
+          `${createdNew > 0 ? (threadIds.length === 1 ? '(new)' : `(${createdNew} new)`) : ''}` +
+          ` join=${joins} threadLine=${draft.threadLine ?? 'rules'}` +
+          `${applied.some((entry) => entry.topicUpdated) ? ' topic=updated' : ''}`,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -1732,6 +1748,18 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
       threadTopic: attribution.topic,
       threadLine: draft.threadLine ?? null,
       topicUpdated: attribution.topicUpdated,
+      // Only when the segment actually split: one thread is the old shape, and the
+      // per-turn runs are what makes a wrong split diagnosable later (0028 ③).
+      ...(applied.length > 1
+        ? {
+            threadSpans: applied.map((entry, index) => ({
+              span: spanTurns[index].promptNo,
+              thread: entry.threadId,
+              join: entry.joinReason,
+              created: entry.created,
+            })),
+          }
+        : {}),
       origin,
       joinReason: attribution.joinReason,
       ms,
@@ -1851,7 +1879,11 @@ export async function drainExtractionQueue(options = {}) {
     // turn, so a fact's 轮次 lands on source_turn_id.
     const turns = taken.map((entry, index) => ({
       id: entry.item.turnId,
+      // Prompt numbering (1..n, what the model's spans match) and the host's real
+      // turn number (threads count turns that jump by 10–30) are different numbers;
+      // both ride along so attribution never has to guess which is which.
       turnNo: index + 1,
+      hostTurnNo: entry.row.turn,
       userText: entry.row.userText,
       assistantText: entry.row.assistantText,
       startedAt: entry.row.at,
