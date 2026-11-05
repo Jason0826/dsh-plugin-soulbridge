@@ -233,6 +233,70 @@ export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns
   };
 }
 
+/**
+ * When a session has grown past the point where starting a new one is cheaper (0026).
+ *
+ * The signal is prompt tokens per request — how much history every single call re-buys —
+ * with the turn count as the second axis. 300k is where the old session degraded; 100
+ * turns is where continuing stops being cheap even at a smaller context.
+ */
+const SWITCH_SESSION = { contextPerRequest: 300_000, turns: 100 };
+
+/** The reminder the model relays: the reply is the only channel the user reads. */
+export function renderSwitchSession(stats, perRequest) {
+  const thousands = Math.round(perRequest / 1000);
+  return (
+    `<switch-session turns="${stats.turns}" context-per-request="${Math.round(perRequest)}">` +
+    `这个会话已经很大（每请求约 ${thousands}k token 上下文，共 ${stats.turns} 轮）。` +
+    `请提醒用户：新开一个会话更省——先把进度写进 docs/state.md 的接手须知，` +
+    `再到新会话用「读 docs/state.md 的接手须知」开头。` +
+    `</switch-session>`
+  );
+}
+
+/**
+ * Per-session cost ledger. It answers one question: has this session crossed the point
+ * where a new one is cheaper, and has the user been told yet?
+ *
+ * Not a nag: the reminder fires once per level, and a level is one more notch of the
+ * same threshold (600k/req or 200 turns is level 2). Crossing again by a doubling is
+ * worth saying again; saying it every turn is wallpaper.
+ */
+export function createSessionLedger({ thresholds = SWITCH_SESSION } = {}) {
+  const cost = new Map();
+  const reminded = new Map();
+  return {
+    /** Feed one finished turn — the turn-cost report. */
+    note(record) {
+      const id = String(record?.session ?? 'default');
+      const stats = cost.get(id) ?? { turns: 0, requests: 0, prompt: 0 };
+      stats.turns += 1;
+      stats.requests += Number(record?.requests) || 0;
+      stats.prompt +=
+        (Number(record?.input) || 0) + (Number(record?.cacheHit) || 0) + (Number(record?.cacheWrite) || 0);
+      cost.set(id, stats);
+      // Bounded like the tracker: a long-lived host must not accumulate sessions forever.
+      if (cost.size > 16) cost.delete(cost.keys().next().value);
+    },
+    /** The reminder block when a new level is crossed; '' otherwise. */
+    due(sessionId) {
+      const id = String(sessionId ?? 'default');
+      const stats = cost.get(id);
+      if (!stats || stats.requests === 0) return '';
+      const perRequest = stats.prompt / stats.requests;
+      const level = Math.floor(
+        Math.max(perRequest / thresholds.contextPerRequest, stats.turns / thresholds.turns),
+      );
+      if (level < 1 || level <= (reminded.get(id) ?? 0)) return '';
+      reminded.set(id, level);
+      return renderSwitchSession(stats, perRequest);
+    },
+  };
+}
+
+/** One ledger for the running host: a session is remembered across pre-steps. */
+const sessionLedger = createSessionLedger();
+
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
 
 /**
@@ -1147,7 +1211,10 @@ export function createPreStepHandler(deps) {
       // previous session: one session can hold several topics, and a topic can
       // span sessions. Injected once per session, when it is a different one.
       const handoff = takeHandoff(sessionId);
-      const block = [handoff, related].filter(Boolean).join('\n\n');
+      // 0026: when this session has already grown past the point where a new one is
+      // cheaper, say so once per level — the reply is the only channel the user reads.
+      const switchHint = sessionLedger.due(sessionId);
+      const block = [handoff, switchHint, related].filter(Boolean).join('\n\n');
       injectedTurn.set(sessionId, turn);
       if (injectedTurn.size > 16) {
         // Keep the map bounded: drop the oldest entry, not the newest.
@@ -1168,6 +1235,10 @@ export function createPreStepHandler(deps) {
       const idPart = used.length > 0 ? ` ids=[${used.join(',')}]` : '';
       log(`prestep: inject turn=${turn} chars=${block.length}${idPart} handoff=${handoff ? 'yes' : 'no'}`);
       trace({ event: 'inject', session: sessionId, turn, chars: block.length, ids: used, handoff: Boolean(handoff) });
+      if (switchHint) {
+        log(`switch-session: remind turn=${turn}`);
+        trace({ event: 'switch_session', session: sessionId, turn });
+      }
       return { ...decision, messages: [...decision.messages, note] };
     } catch (error) {
       log(`prestep: skipped after error: ${error instanceof Error ? error.message : String(error)}`);
@@ -2523,7 +2594,12 @@ export function apply(ctx) {
   // reaches the threshold also gets one line in plugin.log. Attached before the
   // event listener so no turn can be missed.
   turnCostTracker = createTurnCostTracker({
-    onReport: (record) => trace(record),
+    onReport: (record) => {
+      trace(record);
+      // 0026 reminder: the same record that makes a turn visible also answers
+      // "is this session too big to keep going".
+      sessionLedger.note(record);
+    },
     onAlert: (line) => log(line),
   });
 

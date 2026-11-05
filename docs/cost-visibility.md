@@ -55,3 +55,21 @@ node scripts/billing.mjs --json             # 给程序读
 |---|---|
 | `turn cost: session=… turn=… requests=N (steps=S failed=F plugin=P)` | 这一轮到了 30 次请求 |
 | `{"event":"turn-cost",…}`（trace） | 每轮一条，字段见上表 |
+
+## 提醒换会话（2026-11-05）
+
+同一条 `turn-cost` 记录还回答另一个问题：**这个会话还能不能继续开下去**。
+
+```
+阈值（插件内常量 SWITCH_SESSION，一处声明）
+  每请求上下文 ≥ 300k token（历史会话 420k 时出过整轮空回复）
+  或 轮数 ≥ 100
+节奏  每跨一级提醒一次；600k/200 轮是第 2 级——翻倍才再说，不是每轮都说
+落点  pre-step 注入 <switch-session turns=… context-per-request=…>，由模型转告用户
+      plugin.log 一行  switch-session: remind turn=N
+      trace 一条  {"event":"switch_session",…}
+```
+
+**为什么由模型转告，而不是插件自己弹提示**：插件没有写"用户可见消息"的通道，能保证用户看到的只有回复本身。所以注入的是一句**给模型的指令**（"请提醒用户……"），而不是一条通知。
+
+**为什么每级只说一次**：每轮都说会变成墙纸；翻倍才说，说明"情况确实更糟了"。
