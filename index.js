@@ -1426,7 +1426,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
     const inferred = result.facts.filter((fact) => fact.source === 'inferred').length;
     log(
       `extract ok: by=${draft.by} reason=${draft.reason ?? '-'} entities=${result.entities.length} facts=${result.facts.length}` +
-        ` gaps=${result.gaps.length} skipped=${result.skipped.length}` +
+        ` gaps=${result.gaps.length} skipped=${result.skipped.length} draftSkipped=${(draft.skipped ?? []).length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +
         ` unit=${turns ? `${turns.length}turns` : '1turn'} threadId=${thread?.id ?? '-'}` +
@@ -1437,6 +1437,12 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
+    }
+    // Draft-level drops are the extractor's own decisions (a sentence it could not
+    // structure, an item the model wrote and the gate refused). Visible here so the
+    // floor cannot throw work away silently.
+    for (const dropped of (draft.skipped ?? []).slice(0, 3)) {
+      log(`  extract dropped: ${dropped.what} (${dropped.reason})`);
     }
     for (const slot of result.droppedSlots.slice(0, 3)) {
       log(`  extract slot kept as text: ${slot.slot}=${slot.value} (undeclared)`);
@@ -1450,6 +1456,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', thread = nul
       facts: result.facts.length,
       gaps: result.gaps.length,
       skipped: result.skipped,
+      draftSkipped: (draft.skipped ?? []).slice(0, 5),
       droppedSlots: result.droppedSlots,
       holderFallbacks: result.holderFallbacks,
       thread: attribution.threadId,
