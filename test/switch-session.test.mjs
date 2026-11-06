@@ -17,9 +17,8 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-switch-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { createSessionLedger, renderSwitchSession, renderContextCompact, PROACTIVE_TRIGGERS } = await import(
-  '../index.js'
-);
+const { createSessionLedger, renderSwitchSession, renderContextCompact, renderCompactLimit, PROACTIVE_TRIGGERS } =
+  await import('../index.js');
 
 test('below the threshold nothing is said', () => {
   const ledger = createSessionLedger();
@@ -109,9 +108,70 @@ test('a new habit is a new row, not a new code path (0018 §0)', () => {
   assert.equal(ledger.due('s1'), null, 'once per level, same as every other row');
   assert.deepEqual(
     PROACTIVE_TRIGGERS.map((trigger) => trigger.id),
-    ['context-compact', 'switch-session'],
-    'the shipped registry order: compact line first, switch second',
+    ['compact-limit', 'context-compact', 'switch-session'],
+    'the shipped order: budget row first, then the compact line, then switch',
   );
+});
+
+test('a compaction resets the arc: the stale-350k bug (2026-11-07)', () => {
+  const ledger = createSessionLedger();
+  ledger.note({ session: 's1', requests: 9, cacheHit: 3_193_245 }); // 354.8k — turn 13
+  assert.equal(ledger.due('s1').id, 'context-compact', 'the line fires on the pre-compact arc');
+  assert.equal(ledger.compact('s1'), 1, 'the host compacted; the caller traces the count');
+  assert.equal(
+    ledger.due('s1'),
+    null,
+    'right after compaction there is nothing to advise on — the arc is empty, not 350k',
+  );
+  ledger.note({ session: 's1', requests: 10, cacheHit: 2_700_000 }); // new arc at 270k
+  const again = ledger.due('s1');
+  assert.equal(
+    again?.id,
+    'context-compact',
+    'level 1 again: without re-arming the gate, reminded=1 would keep it silent',
+  );
+  assert.equal(ledger.due('s1'), null, 'once per level, as always');
+});
+
+test('two compactions spend the budget: the next 200k crossing advises switching', () => {
+  const ledger = createSessionLedger();
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000 }); // 200k
+  assert.equal(ledger.due('s1').id, 'context-compact', 'budget 1 of 2: compact advice');
+  ledger.compact('s1');
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000 }); // fresh arc, 200k
+  assert.equal(ledger.due('s1').id, 'context-compact', 'budget 2 of 2: still compact advice');
+  ledger.compact('s1');
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000 }); // fresh arc, 200k again
+  const fire = ledger.due('s1');
+  assert.equal(fire?.id, 'compact-limit', 'budget spent: the limit row owns the line');
+  assert.match(fire.block, /compactions="2"/);
+  assert.match(fire.block, /两压一会话/);
+  assert.match(fire.block, /state\.md/);
+  assert.equal(ledger.due('s1'), null, 'once per level, as always');
+});
+
+test('the two rows partition the line by compaction budget (0018 §0 contract)', () => {
+  const limit = PROACTIVE_TRIGGERS.find((trigger) => trigger.id === 'compact-limit');
+  const compact = PROACTIVE_TRIGGERS.find((trigger) => trigger.id === 'context-compact');
+  const fresh = { turns: 8, requests: 40, prompt: 8_000_000, compactions: 0, recentRequests: [] };
+  const spent = { ...fresh, compactions: 2 };
+  assert.equal(compact.level(fresh, 201_000), 1, 'budget intact: the compact row speaks');
+  assert.equal(limit.level(fresh, 201_000), 0, 'budget intact: the limit row stays silent');
+  assert.equal(compact.level(spent, 201_000), 0, 'budget spent: the compact row yields the line');
+  assert.equal(limit.level(spent, 201_000), 1, 'budget spent: the limit row takes it');
+  assert.equal(limit.level(spent, 150_000), 0, 'below the line nobody speaks, budget or not');
+});
+
+test('the blocks price the ride (2026-11-07 cost model)', () => {
+  // carry rate = 5 req/turn x ¥0.02 hit + 0.29 eviction x ¥1 miss = ¥0.39 per M per turn.
+  const compactText = renderContextCompact({ turns: 13, requests: 95, prompt: 34_000_000 }, 342_350);
+  assert.match(compactText, /每轮约 ¥0\.13/, '342k x 0.39 = ¥0.13 per turn');
+  assert.match(compactText, /¥0\.01/, 'post-compact baseline 27k costs ¥0.01');
+  assert.match(compactText, /13 倍/, '342k / 27k');
+  assert.match(compactText, /离开较久/, 'the turn-12 lesson rides along: compact before long gaps');
+  const limitText = renderCompactLimit({ turns: 20, requests: 120, prompt: 24_000_000, compactions: 2 }, 201_000);
+  assert.match(limitText, /compactions="2"/);
+  assert.match(limitText, /¥0\.08/, '201k x 0.39 = ¥0.08 per turn');
 });
 
 test.after(() => {

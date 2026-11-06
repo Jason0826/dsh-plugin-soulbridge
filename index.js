@@ -245,13 +245,58 @@ const SWITCH_SESSION = { contextPerRequest: 300_000, turns: 100 };
 /** The 0018 compact line: the same signal one notch earlier — compact before switching. */
 const CONTEXT_COMPACT = { contextPerRequest: 200_000 };
 
+/**
+ * 两压一会话, priced (2026-11-07): an EOQ model over our own trace says money stops
+ * deciding between compact and switching (~5% apart), so narrative is the only axis —
+ * with narrative at ~¥0.2 per compaction the optimum lands on this same 200k line.
+ * Two compactions is where a summary of a summary starts drifting; from there the line
+ * advises a new session instead, and the compact row goes silent. The two rows
+ * partition the line by compactions < count / >= count.
+ */
+const COMPACT_LIMIT = { count: 2 };
+
+/** Off-peak DeepSeek flash prices, CNY per M tokens (user-provided 2026-11-07). */
+const PRICE = { hit: 0.02, miss: 1 };
+
+/**
+ * Measured eviction rate: 4 of 14 inter-turn gaps re-read the whole context (trace
+ * 2026-11-06). A miss costs 50x a hit, so this expected value is ~3/4 of the carry
+ * rate — it is why compaction pays, and why leaving for long should end with one.
+ */
+const P_EVICT = 0.29;
+
+/** Post-compaction baseline: turn 14 measured 27k per request right after /compact. */
+const POST_COMPACT = 27_000;
+
+/** Requests per turn before the ledger has samples (median of the measured session). */
+const REQUESTS_FALLBACK = 5;
+
+/** CNY per M tokens per turn: every request re-buys the context, gaps may evict it. */
+function carryRate(stats) {
+  const recent = Array.isArray(stats?.recentRequests) ? stats.recentRequests : [];
+  const n =
+    recent.length > 0 ? recent.reduce((sum, value) => sum + value, 0) / recent.length : REQUESTS_FALLBACK;
+  return n * PRICE.hit + P_EVICT * PRICE.miss;
+}
+
+/** What riding this context costs each turn (off-peak, expected value over gaps). */
+function perTurnCost(stats, context) {
+  return (carryRate(stats) * context) / 1e6;
+}
+
 /** The advice the model relays: the reply is the only channel the user reads. */
 export function renderContextCompact(stats, perRequest) {
   const thousands = Math.round(perRequest / 1000);
+  const costNow = perTurnCost(stats, perRequest).toFixed(2);
+  const costAfter = perTurnCost(stats, POST_COMPACT).toFixed(2);
+  const ratio = Math.max(1, Math.round(perRequest / POST_COMPACT));
   return (
     `<proactive id="context-compact" context-per-request="${Math.round(perRequest)}">` +
-    `上下文已经到每请求约 ${thousands}k token。请在合适处告诉用户一句：现在适合 /compact 续命——` +
-    `他的习惯是留在本会话压缩、不换新会话；若正在收口，压缩前先把进度写进 docs/state.md。` +
+    `上下文已经到每请求约 ${thousands}k token——离峰价下每轮约 ¥${costNow}，` +
+    `压缩到基线后每轮约 ¥${costAfter}（差 ${ratio} 倍）。` +
+    `请在合适处告诉用户一句：现在适合 /compact 续命——` +
+    `他的习惯是留在本会话压缩、不换新会话；若正在收口，压缩前先把进度写进 docs/state.md；` +
+    `若这轮之后要离开较久，也建议先压（间隔后的全量重读按未命中全价计）。` +
     `提这一次即可，不要每轮重复。` +
     `</proactive>`
   );
@@ -270,6 +315,27 @@ export function renderSwitchSession(stats, perRequest) {
 }
 
 /**
+ * The balance point made mechanical (2026-11-07): at two compactions the budget is
+ * spent — the next compact would summarize a summary. Fires on the next 200k crossing,
+ * because that is where the next compact decision actually happens; an immediate
+ * nudge right after the compaction would argue with this row eight turns later.
+ */
+export function renderCompactLimit(stats, perRequest) {
+  const thousands = Math.round(perRequest / 1000);
+  const costNow = perTurnCost(stats, perRequest).toFixed(2);
+  const compactions = stats?.compactions ?? 0;
+  return (
+    `<proactive id="compact-limit" compactions="${compactions}" context-per-request="${Math.round(perRequest)}">` +
+    `本会话已压缩 ${compactions} 次，上下文又到每请求约 ${thousands}k（每轮约 ¥${costNow}，离峰价）。` +
+    `摘要套摘要会失真——按「两压一会话」，这次请建议用户换新会话：` +
+    `新开前先把进度写进 docs/state.md 的接手须知，` +
+    `再到新会话用「读 docs/state.md 的接手须知」开头。` +
+    `提这一次即可。` +
+    `</proactive>`
+  );
+}
+
+/**
  * 0018 proactive triggers — declarative rows. A new habit is a new row; needing a new
  * code path means the framework failed (0018 §0 acceptance line). Each row carries an
  * id, the action kind (four choices, default silent — every row here is asking), a
@@ -278,9 +344,24 @@ export function renderSwitchSession(stats, perRequest) {
  */
 export const PROACTIVE_TRIGGERS = [
   {
+    // Budget spent (>= 2 compactions): this row owns the 200k line from here on.
+    id: 'compact-limit',
+    action: 'asking',
+    level: (stats, perRequest) =>
+      (stats.compactions ?? 0) >= COMPACT_LIMIT.count &&
+      perRequest >= CONTEXT_COMPACT.contextPerRequest
+        ? Math.floor(perRequest / CONTEXT_COMPACT.contextPerRequest)
+        : 0,
+    render: (stats, perRequest) => renderCompactLimit(stats, perRequest),
+  },
+  {
+    // Yields the line to compact-limit once the budget is spent (the partition test).
     id: 'context-compact',
     action: 'asking',
-    level: (stats, perRequest) => Math.floor(perRequest / CONTEXT_COMPACT.contextPerRequest),
+    level: (stats, perRequest) =>
+      (stats.compactions ?? 0) >= COMPACT_LIMIT.count
+        ? 0
+        : Math.floor(perRequest / CONTEXT_COMPACT.contextPerRequest),
     render: (stats, perRequest) => renderContextCompact(stats, perRequest),
   },
   {
@@ -297,8 +378,11 @@ export const PROACTIVE_TRIGGERS = [
  * where advice is worth saying, and has the user been told yet?
  *
  * Rows fire in registry order, each once per level: 200k suggests compact (0018 first
- * slice), 300k/100 turns still says switch — compact first, switching is the fallback.
- * Crossing again by a doubling is worth saying again; saying it every turn is wallpaper.
+ * slice) while the compaction budget lasts, then the same line advises a new session
+ * (compact-limit), 300k/100 turns still says switch — compact first, switching is the
+ * fallback. Crossing again by a doubling is worth saying again; saying it every turn
+ * is wallpaper. compact() restarts the context arc: without it the ledger averages
+ * pre-compact prompts (turn 14 reported 350k while the session sat at 27k).
  */
 export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
   const cost = new Map();
@@ -307,14 +391,39 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
     /** Feed one finished turn — the turn-cost report. */
     note(record) {
       const id = String(record?.session ?? 'default');
-      const stats = cost.get(id) ?? { turns: 0, requests: 0, prompt: 0 };
+      const stats =
+        cost.get(id) ?? { turns: 0, requests: 0, prompt: 0, compactions: 0, recentRequests: [] };
       stats.turns += 1;
-      stats.requests += Number(record?.requests) || 0;
+      const requests = Number(record?.requests) || 0;
+      stats.requests += requests;
       stats.prompt +=
         (Number(record?.input) || 0) + (Number(record?.cacheHit) || 0) + (Number(record?.cacheWrite) || 0);
+      // Rolling requests/turn: the cost render prices per turn, and the pattern is
+      // task style — it survives compaction, unlike the context arc below.
+      stats.recentRequests ??= [];
+      stats.recentRequests.push(requests);
+      if (stats.recentRequests.length > 6) stats.recentRequests.shift();
       cost.set(id, stats);
       // Bounded like the tracker: a long-lived host must not accumulate sessions forever.
       if (cost.size > 16) cost.delete(cost.keys().next().value);
+    },
+    /**
+     * The host compacted: restart the context arc so the 200k line re-arms, and count
+     * the compaction for compact-limit. turns survives (age guard) and recentRequests
+     * survives (task style). Returns the new count so the caller can trace it.
+     */
+    compact(sessionId) {
+      const id = String(sessionId ?? 'default');
+      const stats = cost.get(id);
+      if (!stats) return 0;
+      stats.compactions = (stats.compactions ?? 0) + 1;
+      stats.prompt = 0;
+      stats.requests = 0;
+      // Re-arm only the compact line: its level is arc-derived. switch-session's level
+      // is also age-derived (turns), and repeated-compaction advice now belongs to
+      // compact-limit — leave that gate consumed.
+      reminded.delete(`${id}:context-compact`);
+      return stats.compactions;
     },
     /** The advice when a row crosses a new level; null otherwise. */
     due(sessionId) {
@@ -3066,6 +3175,11 @@ export function apply(ctx) {
             at: Date.now(),
             compactionId: event.data?.compactionId ?? null,
           });
+          // The cost ledger tracks the context arc: a compaction restarts it, or the
+          // next advice averages pre-compact prompts (turn 14 said 350k at a real 27k).
+          const compactions = sessionLedger.compact(sessionId);
+          log(`ledger: compaction observed, context arc reset (compactions=${compactions})`);
+          trace({ event: 'ledger-compact', session: sessionId, compactions });
         }
         return;
       }
