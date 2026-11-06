@@ -1624,19 +1624,19 @@ function hasSubstance(text) {
 }
 
 /**
- * Extract one unit: a segment (0028), or a single message when there is no segment.
- *
- * `unit` carries the prompt-numbered turns; the attribution the model returns is
- * a product of this call, never an input to it (决定 3). `turnId`/`turnNo` are the
- * segment HEAD — the continuity point before the unit — and the fallback source
- * for facts the model did not number.
+ * Extract one unit: the segment a departure flushed (0028) — required, there is
+ * no single-message mode anymore (retirements extract-per-turn): an unflushed
+ * turn waits for its departure. `unit` carries the prompt-numbered turns; the
+ * attribution the model returns is a product of this call, never an input to it
+ * (决定 3). `turnId`/`turnNo` are the segment HEAD — the continuity point before
+ * the unit — and the fallback source for facts the model did not number.
  */
-async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null) {
+async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
   const config = readConfig();
   if (config.extract === 'off') return 'skipped-off';
   // The unit decides, not its last message: a segment whose final turn is "好的"
   // still holds every turn above it, and taking the unit or none of it is rule 17.
-  const unitTexts = unit?.turns?.length ? unit.turns.map((entry) => entry.userText) : [text];
+  const unitTexts = unit.turns.map((entry) => entry.userText);
   if (typeof text !== 'string' || !unitTexts.some((entry) => typeof entry === 'string' && hasSubstance(entry))) {
     log(
       `extract skipped: no substance (chars=${unitTexts.reduce((n, entry) => n + (typeof entry === 'string' ? entry.length : 0), 0)})` +
@@ -1650,7 +1650,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
     const soul = ensureSoul();
     const turnRow = soul.turn(turnId);
     // The context carries both halves of continuity (ADR 0034): the candidates' last
-    // lines, and the previous user line — extraction is per turn, so without it the
+    // lines, and the previous user line — the unit is a segment, so without them the
     // model cannot tell "继续" from a new subject.
     const context = soul.extractionContext(20, { turnNo, sessionId: turnRow?.sessionId });
     // "The previous turn belonged to this thread" is the cheapest continuity hint
@@ -1662,8 +1662,8 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
     // 0028: the unit is the segment a departure flushed. The turns array is
     // numbered the way the prompt numbers them (1..n inside the unit), and each
     // fact may name its own turn — turnIds maps that number back to the real turn.
-    const turns = unit?.turns ?? null;
-    const turnIds = turns ? Object.fromEntries(turns.map((entry) => [entry.turnNo, entry.id])) : undefined;
+    const turns = unit.turns;
+    const turnIds = Object.fromEntries(turns.map((entry) => [entry.turnNo, entry.id]));
     const draft = await soul.extract(text, {
       llm: useLlm ? injectedLlm : undefined,
       mode: useLlm ? 'auto' : 'rules',
@@ -1673,7 +1673,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
       // The exchange, not the message (ADR 0035): my reply is where promises and
       // decisions live, and it is the only way "我的承诺" can ever be extracted.
       assistantText: turnRow?.assistantText ?? undefined,
-      turns: turns ?? undefined,
+      turns,
     });
     const result = soul.commitDrafts(draft, { turnId, turnIds });
     // Attribution is written even when nothing was extracted: a turn that says
@@ -1681,12 +1681,12 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
     // fanned over per turn (0028 ③): every turn of the segment gets attached, a
     // turn no span covers chains to the previous one, and the continue/new/
     // fallback chain inside applyThread is untouched (ADR 0034).
-    const spanTurns = (turns ?? [{ turnNo: 1, id: turnId, userText: text }]).map((entry) => ({
+    const spanTurns = turns.map((entry) => ({
       promptNo: entry.turnNo,
       turnNo: entry.hostTurnNo ?? turnNo,
       turnId: entry.id,
       at: entry.startedAt ?? Date.now(),
-      fallbackTopic: firstSentence(entry.userText ?? text),
+      fallbackTopic: firstSentence(entry.userText),
     }));
     const applied = soul.applyThreadSpans(draft.spans, {
       sessionId: turnRow?.sessionId ?? 'unknown',
@@ -1712,7 +1712,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit = null)
         ` gaps=${result.gaps.length} skipped=${result.skipped.length} draftSkipped=${(draft.skipped ?? []).length}` +
         ` slots->text=${result.droppedSlots.length} holder->world=${result.holderFallbacks.length}` +
         ` inferred=${inferred}` +
-        ` unit=${turns ? `${turns.length}turns` : '1turn'}` +
+        ` unit=${turns.length}turns` +
         ` ms=${ms} turn=${turnNo} origin=${origin}` +
         ` thread=${threadIds.join(',')}` +
           `${createdNew > 0 ? (threadIds.length === 1 ? '(new)' : `(${createdNew} new)`) : ''}` +
