@@ -56,20 +56,24 @@ node scripts/billing.mjs --json             # 给程序读
 | `turn cost: session=… turn=… requests=N (steps=S failed=F plugin=P)` | 这一轮到了 30 次请求 |
 | `{"event":"turn-cost",…}`（trace） | 每轮一条，字段见上表 |
 
-## 提醒换会话（2026-11-05）
+## 主动建议（2026-11-05 提醒换会话；2026-11-06 泛化为触发器注册表，[0018](https://github.com/Jason0826/soulbridge/blob/main/docs/briefs/0018-behaviour-influence.md)）
 
 同一条 `turn-cost` 记录还回答另一个问题：**这个会话还能不能继续开下去**。
 
 ```
-阈值（插件内常量 SWITCH_SESSION，一处声明）
-  每请求上下文 ≥ 300k token（历史会话 420k 时出过整轮空回复）
-  或 轮数 ≥ 100
-节奏  每跨一级提醒一次；600k/200 轮是第 2 级——翻倍才再说，不是每轮都说
-落点  pre-step 注入 <switch-session turns=… context-per-request=…>，由模型转告用户
-      plugin.log 一行  switch-session: remind turn=N
-      trace 一条  {"event":"switch_session",…}
+注册表   PROACTIVE_TRIGGERS（声明式行：新习惯 = 加一行，不改代码路径）
+  行 context-compact   每请求上下文 ≥ 200k → 建议 /compact 续命
+                       （用户偏好留在本会话，不换新会话）
+  行 switch-session    每请求 ≥ 300k 或 轮数 ≥ 100 → 换会话提醒，
+                       措辞已改为「优先 /compact，反复压缩或变慢再新开」
+节奏     每行每级一次；翻倍（400k / 600k…）才再说——不是每轮都说
+落点     pre-step 注入 <proactive id=…>，由模型转告用户
+       plugin.log 一行  proactive: remind id=… turn=N trigger=…
+       trace 一条  {"event":"proactive","id":…,"action":"asking","trigger":…}
 ```
 
 **为什么由模型转告，而不是插件自己弹提示**：插件没有写"用户可见消息"的通道，能保证用户看到的只有回复本身。所以注入的是一句**给模型的指令**（"请提醒用户……"），而不是一条通知。
 
 **为什么每级只说一次**：每轮都说会变成墙纸；翻倍才说，说明"情况确实更糟了"。
+
+**为什么是两行**：200k 是"该 compact 了"的提前量，300k 是"compact 可能不够了"的升级——先建议压缩，再建议换会话。两行的 action 都是 asking（0018 动作四选一），默认 silent 不在注册表里。

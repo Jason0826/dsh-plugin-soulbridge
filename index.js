@@ -242,27 +242,65 @@ export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns
  */
 const SWITCH_SESSION = { contextPerRequest: 300_000, turns: 100 };
 
-/** The reminder the model relays: the reply is the only channel the user reads. */
+/** The 0018 compact line: the same signal one notch earlier — compact before switching. */
+const CONTEXT_COMPACT = { contextPerRequest: 200_000 };
+
+/** The advice the model relays: the reply is the only channel the user reads. */
+export function renderContextCompact(stats, perRequest) {
+  const thousands = Math.round(perRequest / 1000);
+  return (
+    `<proactive id="context-compact" context-per-request="${Math.round(perRequest)}">` +
+    `上下文已经到每请求约 ${thousands}k token。请在合适处告诉用户一句：现在适合 /compact 续命——` +
+    `他的习惯是留在本会话压缩、不换新会话；若正在收口，压缩前先把进度写进 docs/state.md。` +
+    `提这一次即可，不要每轮重复。` +
+    `</proactive>`
+  );
+}
+
 export function renderSwitchSession(stats, perRequest) {
   const thousands = Math.round(perRequest / 1000);
   return (
-    `<switch-session turns="${stats.turns}" context-per-request="${Math.round(perRequest)}">` +
+    `<proactive id="switch-session" turns="${stats.turns}" context-per-request="${Math.round(perRequest)}">` +
     `这个会话已经很大（每请求约 ${thousands}k token 上下文，共 ${stats.turns} 轮）。` +
-    `请提醒用户：新开一个会话更省——先把进度写进 docs/state.md 的接手须知，` +
+    `请提醒用户：优先 /compact 续命；若已反复压缩或明显变慢，再新开会话——` +
+    `新开前先把进度写进 docs/state.md 的接手须知，` +
     `再到新会话用「读 docs/state.md 的接手须知」开头。` +
-    `</switch-session>`
+    `</proactive>`
   );
 }
 
 /**
- * Per-session cost ledger. It answers one question: has this session crossed the point
- * where a new one is cheaper, and has the user been told yet?
- *
- * Not a nag: the reminder fires once per level, and a level is one more notch of the
- * same threshold (600k/req or 200 turns is level 2). Crossing again by a doubling is
- * worth saying again; saying it every turn is wallpaper.
+ * 0018 proactive triggers — declarative rows. A new habit is a new row; needing a new
+ * code path means the framework failed (0018 §0 acceptance line). Each row carries an
+ * id, the action kind (four choices, default silent — every row here is asking), a
+ * level over the session ledger, and the block to relay. v1 cost-gate = level crossing
+ * + once per level; saying it every turn is wallpaper.
  */
-export function createSessionLedger({ thresholds = SWITCH_SESSION } = {}) {
+export const PROACTIVE_TRIGGERS = [
+  {
+    id: 'context-compact',
+    action: 'asking',
+    level: (stats, perRequest) => Math.floor(perRequest / CONTEXT_COMPACT.contextPerRequest),
+    render: (stats, perRequest) => renderContextCompact(stats, perRequest),
+  },
+  {
+    id: 'switch-session',
+    action: 'asking',
+    level: (stats, perRequest) =>
+      Math.floor(Math.max(perRequest / SWITCH_SESSION.contextPerRequest, stats.turns / SWITCH_SESSION.turns)),
+    render: (stats, perRequest) => renderSwitchSession(stats, perRequest),
+  },
+];
+
+/**
+ * Per-session cost ledger. It answers one question: has this session crossed a line
+ * where advice is worth saying, and has the user been told yet?
+ *
+ * Rows fire in registry order, each once per level: 200k suggests compact (0018 first
+ * slice), 300k/100 turns still says switch — compact first, switching is the fallback.
+ * Crossing again by a doubling is worth saying again; saying it every turn is wallpaper.
+ */
+export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
   const cost = new Map();
   const reminded = new Map();
   return {
@@ -278,18 +316,24 @@ export function createSessionLedger({ thresholds = SWITCH_SESSION } = {}) {
       // Bounded like the tracker: a long-lived host must not accumulate sessions forever.
       if (cost.size > 16) cost.delete(cost.keys().next().value);
     },
-    /** The reminder block when a new level is crossed; '' otherwise. */
+    /** The advice when a row crosses a new level; null otherwise. */
     due(sessionId) {
       const id = String(sessionId ?? 'default');
       const stats = cost.get(id);
-      if (!stats || stats.requests === 0) return '';
+      if (!stats || stats.requests === 0) return null;
       const perRequest = stats.prompt / stats.requests;
-      const level = Math.floor(
-        Math.max(perRequest / thresholds.contextPerRequest, stats.turns / thresholds.turns),
-      );
-      if (level < 1 || level <= (reminded.get(id) ?? 0)) return '';
-      reminded.set(id, level);
-      return renderSwitchSession(stats, perRequest);
+      for (const trigger of triggers) {
+        const level = trigger.level(stats, perRequest);
+        if (level < 1 || level <= (reminded.get(`${id}:${trigger.id}`) ?? 0)) continue;
+        reminded.set(`${id}:${trigger.id}`, level);
+        return {
+          id: trigger.id,
+          action: trigger.action,
+          block: trigger.render(stats, perRequest),
+          trigger: Math.round(perRequest),
+        };
+      }
+      return null;
     },
   };
 }
@@ -1241,10 +1285,10 @@ export function createPreStepHandler(deps) {
       // previous session: one session can hold several topics, and a topic can
       // span sessions. Injected once per session, when it is a different one.
       const handoff = takeHandoff(sessionId);
-      // 0026: when this session has already grown past the point where a new one is
-      // cheaper, say so once per level — the reply is the only channel the user reads.
-      const switchHint = sessionLedger.due(sessionId);
-      const block = [handoff, switchHint, related].filter(Boolean).join('\n\n');
+      // 0018: proactive advice — declarative rows fire once per level; the reply is
+      // the only channel the user reads.
+      const proactive = sessionLedger.due(sessionId);
+      const block = [handoff, proactive?.block ?? '', related].filter(Boolean).join('\n\n');
       injectedTurn.set(sessionId, turn);
       if (injectedTurn.size > 16) {
         // Keep the map bounded: drop the oldest entry, not the newest.
@@ -1265,9 +1309,9 @@ export function createPreStepHandler(deps) {
       const idPart = used.length > 0 ? ` ids=[${used.join(',')}]` : '';
       log(`prestep: inject turn=${turn} chars=${block.length}${idPart} handoff=${handoff ? 'yes' : 'no'}`);
       trace({ event: 'inject', session: sessionId, turn, chars: block.length, ids: used, handoff: Boolean(handoff) });
-      if (switchHint) {
-        log(`switch-session: remind turn=${turn}`);
-        trace({ event: 'switch_session', session: sessionId, turn });
+      if (proactive) {
+        log(`proactive: remind id=${proactive.id} turn=${turn} trigger=${proactive.trigger}`);
+        trace({ event: 'proactive', id: proactive.id, action: proactive.action, session: sessionId, turn, trigger: proactive.trigger });
       }
       return { ...decision, messages: [...decision.messages, note] };
     } catch (error) {
