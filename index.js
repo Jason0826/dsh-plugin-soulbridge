@@ -307,6 +307,19 @@ function perTurnCost(stats, context) {
   return (carryRate(stats) * context) / 1e6;
 }
 
+/**
+ * 「（占 1M 窗口的 22%）」— only when the host reported a route capacity. The
+ * percent is the sentence a human can check against the model's real window:
+ * token counts alone read as scary, a share of 1M reads as a budget.
+ */
+function windowNote(stats, context) {
+  const capacity = Number(stats?.contextWindow) || 0;
+  if (capacity <= 0) return '';
+  const percent = Math.round((context / capacity) * 100);
+  const millions = capacity % 1e6 === 0 ? String(capacity / 1e6) : (capacity / 1e6).toFixed(1);
+  return `（占 ${millions}M 窗口的 ${percent}%）`;
+}
+
 /** The advice the model relays: the reply is the only channel the user reads. */
 export function renderContextCompact(stats, perRequest) {
   const thousands = Math.round(perRequest / 1000);
@@ -315,7 +328,7 @@ export function renderContextCompact(stats, perRequest) {
   const ratio = Math.max(1, Math.round(perRequest / POST_COMPACT));
   return (
     `<proactive id="context-compact" context-per-request="${Math.round(perRequest)}">` +
-    `上下文已经到每请求约 ${thousands}k token——离峰价下每轮约 ¥${costNow}，` +
+    `上下文已经到每请求约 ${thousands}k token${windowNote(stats, perRequest)}——离峰价下每轮约 ¥${costNow}，` +
     `压缩到基线后每轮约 ¥${costAfter}（差 ${ratio} 倍）。` +
     `请在合适处告诉用户一句：现在适合 /compact 续命——` +
     `他的习惯是留在本会话压缩、不换新会话；若正在收口，压缩前先把进度写进 docs/state.md；` +
@@ -349,7 +362,7 @@ export function renderCompactLimit(stats, perRequest) {
   const compactions = stats?.compactions ?? 0;
   return (
     `<proactive id="compact-limit" compactions="${compactions}" context-per-request="${Math.round(perRequest)}">` +
-    `本会话已压缩 ${compactions} 次，上下文又到每请求约 ${thousands}k（每轮约 ¥${costNow}，离峰价）。` +
+    `本会话已压缩 ${compactions} 次，上下文又到每请求约 ${thousands}k${windowNote(stats, perRequest)}（每轮约 ¥${costNow}，离峰价）。` +
     `摘要套摘要会失真——按「两压一会话」，这次请建议用户换新会话：` +
     `新开前先把进度写进 docs/state.md 的接手须知，` +
     `再到新会话用「读 docs/state.md 的接手须知」开头。` +
@@ -421,7 +434,7 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       const id = String(record?.session ?? 'default');
       const stats =
         cost.get(id) ??
-        { turns: 0, requests: 0, prompt: 0, mainMax: 0, compactions: 0, recentRequests: [] };
+        { turns: 0, requests: 0, prompt: 0, mainMax: 0, contextTokens: 0, contextWindow: 0, compactions: 0, recentRequests: [] };
       stats.turns += 1;
       const requests = Number(record?.requests) || 0;
       stats.requests += requests;
@@ -441,9 +454,31 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       if (cost.size > 16) cost.delete(cost.keys().next().value);
     },
     /**
+     * Host truth for the gate (0.0.126): the host's own token meter reports the
+     * provider's prompt size for the latest request, delivered when the host has
+     * the service. Preferred over our reconstruction (`mainMax`) because it is the
+     * authority — the number the next request will actually be billed for. Best
+     * effort: absent service or a failure keeps the ledger on `mainMax`.
+     * @param {string} sessionId
+     * @param {number} tokens - request-pressure tokens (prompt size, output excluded)
+     * @param {number} [window] - route capacity, when the adapter advertised one
+     */
+    noteContext(sessionId, tokens, window) {
+      const id = String(sessionId ?? 'default');
+      const stats =
+        cost.get(id) ??
+        { turns: 0, requests: 0, prompt: 0, mainMax: 0, contextTokens: 0, contextWindow: 0, compactions: 0, recentRequests: [] };
+      const value = Number(tokens) || 0;
+      if (value > 0) stats.contextTokens = value;
+      const capacity = Number(window) || 0;
+      if (capacity > 0) stats.contextWindow = capacity;
+      cost.set(id, stats);
+    },
+    /**
      * The host compacted: restart the context arc so the 200k line re-arms, and count
-     * the compaction for compact-limit. mainMax goes with it — the stale pre-compact
-     * reading must not fire the line again from inside the post-compact window.
+     * the compaction for compact-limit. mainMax and the host reading go with it — the
+     * stale pre-compact number must not fire the line again from inside the fresh
+     * arc (the window capacity survives: that is a model property, not a reading).
      * turns survives (age guard) and recentRequests survives (task style).
      * Returns the new count so the caller can trace it.
      */
@@ -454,11 +489,12 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       // or when a rebuild replays compactions before any turn (A9 finding closed).
       const stats =
         cost.get(id) ??
-        { turns: 0, requests: 0, prompt: 0, mainMax: 0, compactions: 0, recentRequests: [] };
+        { turns: 0, requests: 0, prompt: 0, mainMax: 0, contextTokens: 0, contextWindow: 0, compactions: 0, recentRequests: [] };
       stats.compactions = (stats.compactions ?? 0) + 1;
       stats.prompt = 0;
       stats.requests = 0;
       stats.mainMax = 0;
+      stats.contextTokens = 0;
       // Re-arm only the compact line: its level is arc-derived. switch-session's level
       // is also age-derived (turns), and repeated-compaction advice now belongs to
       // compact-limit — leave that gate consumed.
@@ -470,12 +506,20 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       const id = String(sessionId ?? 'default');
       const stats = cost.get(id);
       if (!stats || stats.requests === 0) return null;
-      // The gate reads the true context: the latest turn's largest host request.
-      // The arc average (prompt/requests) is a lagging statistic — during the
-      // 2026-11-07 climb it read 141k while the live request carried 245k, so
-      // the 200k line stayed silent for five turns. It remains the fallback for
-      // records written before mainMax existed.
-      const context = stats.mainMax > 0 ? stats.mainMax : stats.prompt / stats.requests;
+      // The gate reads the true context, in order of authority:
+      //   1. the host's token meter (the provider's own prompt size, when the host
+      //      has the service — 0.0.126),
+      //   2. this turn's largest host request (mainMax — our own credible measure),
+      //   3. the arc average, only for records written before either existed.
+      // The arc is a lagging statistic: during the 2026-11-07 climb it read 141k
+      // while the live request carried 245k, so the 200k line stayed silent for
+      // five turns.
+      const context =
+        stats.contextTokens > 0
+          ? stats.contextTokens
+          : stats.mainMax > 0
+            ? stats.mainMax
+            : stats.prompt / stats.requests;
       for (const trigger of triggers) {
         const level = trigger.level(stats, context);
         if (level < 1 || level <= (reminded.get(`${id}:${trigger.id}`) ?? 0)) continue;
@@ -3125,6 +3169,18 @@ export function apply(ctx) {
     }
   }
 
+  // The host's own token meter (0.0.126): when the host exposes it, the gate reads
+  // the provider-reported prompt size instead of our reconstruction. Resolved lazily
+  // because services mount in their own order; an absent service is not an error.
+  const tokenMeterOf = () => {
+    try {
+      return ctx.get('tokenMeter');
+    } catch {
+      return undefined;
+    }
+  };
+  let hostContextLogged = false;
+
   const config = readConfig();
   injectedLlm = makeLlm(ctx, config);
   injectedMaxLlmChars = config.maxLlmChars;
@@ -3234,6 +3290,25 @@ export function apply(ctx) {
       // Before any early return below: turn/end is where the cost record is
       // written, and that branch returns.
       turnCostTracker?.observe(sessionId, event);
+
+      // Host truth for the proactive gate: the provider's own prompt size for the
+      // latest request, read from the host's token meter when it is mounted. The
+      // ledger prefers it over mainMax and falls back on its own when it is absent.
+      if (type === 'assistant/message' || type === 'turn/end') {
+        try {
+          const pressure = tokenMeterOf()?.contextPressure?.(session);
+          const tokens = Number(pressure?.pressureTokens) || 0;
+          if (tokens > 0) {
+            sessionLedger.noteContext(sessionId, tokens, Number(pressure?.contextWindow) || 0);
+            if (!hostContextLogged) {
+              hostContextLogged = true;
+              log(`tokenMeter: host context ${tokens} of ${Number(pressure?.contextWindow) || 0} (gate prefers it)`);
+            }
+          }
+        } catch {
+          // Telemetry only: a broken meter must not break turn accounting.
+        }
+      }
 
       // Keep the last reply: a correction only makes sense next to what it targets.
       if (typeof event.data?.turn === 'number') currentTurn = event.data.turn;

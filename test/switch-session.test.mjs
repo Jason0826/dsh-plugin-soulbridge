@@ -155,6 +155,38 @@ test('compaction clears the true-context reading, not just the arc', () => {
   assert.equal(ledger.due('s1'), null, 'the stale 205k must not fire inside the fresh arc');
 });
 
+test('the gate prefers the host reading over our own reconstruction (0.0.126)', () => {
+  const ledger = createSessionLedger();
+  ledger.note({ session: 's1', requests: 2, cacheHit: 400_000, mainMax: 150_000 });
+  assert.equal(ledger.due('s1'), null, '150k is below the line');
+  // The host's token meter reports the provider's own prompt size for the same
+  // session — it also counts tools and the system prompt, so it can be higher.
+  ledger.noteContext('s1', 231_000, 1_000_000);
+  const fire = ledger.due('s1');
+  assert.equal(fire?.id, 'context-compact', 'the host number crossed the line');
+  assert.equal(fire.trigger, 231_000, 'the host number is what fired, not our estimate');
+});
+
+test('a compaction clears the host reading too', () => {
+  const ledger = createSessionLedger();
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000, mainMax: 205_000 });
+  ledger.noteContext('s1', 210_000, 1_000_000);
+  assert.equal(ledger.due('s1').id, 'context-compact');
+  ledger.compact('s1');
+  ledger.note({ session: 's1', requests: 1, input: 1_000 }); // fresh arc, no reading yet
+  assert.equal(ledger.due('s1'), null, 'the stale host reading must not fire inside the fresh arc');
+});
+
+test('the advice says the share of the window (a number a human can check)', () => {
+  const withWindow = renderCompactLimit(
+    { turns: 20, requests: 120, prompt: 24_000_000, compactions: 2, contextWindow: 1_000_000 },
+    221_000,
+  );
+  assert.match(withWindow, /占 1M 窗口的 22%/);
+  const withoutWindow = renderCompactLimit({ turns: 20, requests: 120, prompt: 24_000_000, compactions: 2 }, 221_000);
+  assert.doesNotMatch(withoutWindow, /窗口/, 'no capacity reported, no percentage invented');
+});
+
 test('a restart does not forget the compaction budget (rebuild from trace)', () => {
   const ledger = createSessionLedger();
   const records = [
