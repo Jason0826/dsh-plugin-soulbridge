@@ -1,18 +1,28 @@
 # Restart the CLI web host on its fixed port, then hand back a working token URL.
 #
 # Why not just launch `dsh web`: the host is the action of the DshWebHost scheduled task, so
-# stopping/starting the task replaces it cleanly and the task keeps the process alive.
+# stopping/starting the task replaces it cleanly. The task is a launcher, not a supervisor:
+# it has been observed to record 0xC000013A and end while the host lives on as an orphan, so
+# nothing here may assume "the task is Running" means "the host is alive".
 #
 # Why the .url file: every start mints a new launch token and the browser cookie from the
 # previous start is invalid. Writing the new token URL into a shortcut means a restart does
 # not need a human to copy a line out of a log.
+#
+# Why a separate restart log: the host is launched with `>> web-host.log`, so it holds that
+# file open for its whole life. Appending to the same file from here fails with "file in use"
+# exactly while the host runs -- which is when the interesting lines are written (ready /
+# FAILED) -- so those lines were silently lost: 25 starts on record, 0 "ready at" lines
+# (2026-11-07). Restart bookkeeping goes to web-restart.log; web-host.log stays the host's.
 param(
   [int]$Port = 3080,
   [int]$DelaySeconds = 0,
   [int]$WaitSeconds = 90,
   [string]$TaskName = 'DshWebHost',
   [string]$ProcessName = 'DeepSeek Harness',
-  [switch]$KeepDesktop,
+  # Only pass this when a desktop window is actually open: matching the image name alone would
+  # also hit the web host this script is about to replace.
+  [switch]$StopDesktop,
   # Only opens a browser tab when asked. Unattended restarts must not leave dead tabs behind.
   [switch]$OpenBrowser,
   # Emergency escape only: a red review gate means the batch was not looked at as a whole.
@@ -22,11 +32,19 @@ param(
 $homeDir = Join-Path $env:USERPROFILE '.soulbridge'
 New-Item -ItemType Directory -Force -Path $homeDir | Out-Null
 $log = Join-Path $homeDir 'web-host.log'
+# The host's own stdout; never appended to from here (it is held open by the `>>` redirect).
+$restartLog = Join-Path $homeDir 'web-restart.log'
 $urlFile = Join-Path $homeDir 'web-url.txt'
 $shortcut = Join-Path $homeDir 'DSH-Web.url'
 
 function Write-Log([string]$message) {
-  "{0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $message | Add-Content -Path $log -Encoding utf8
+  $line = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $message
+  try {
+    Add-Content -Path $restartLog -Value $line -Encoding utf8 -ErrorAction Stop
+  } catch {
+    # A restart must never die because bookkeeping could not be written.
+    Write-Warning "web-restart log unavailable: $($_.Exception.Message)"
+  }
 }
 
 function Get-HostPids {
@@ -69,12 +87,17 @@ if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
   }
 }
 
-# 1. One runtime, one client: the desktop app must go before the web host can own it.
-if (-not $KeepDesktop) {
-  $desktop = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+# 1. Desktop and web host are one executable: dsh.cmd runs "DeepSeek Harness.exe" with
+#    ELECTRON_RUN_AS_NODE=1, so both answer to the same image name and share one Runtime.
+#    Killing by image name alone therefore also hits the web host, and would close a desktop
+#    window nobody asked this script to touch. Do it only on request, and only for real
+#    desktop processes (they run the app, not cli.js).
+if ($StopDesktop) {
+  $desktop = @(Get-CimInstance Win32_Process -Filter "Name='$ProcessName.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -notmatch 'cli\.js' })
   if ($desktop.Count -gt 0) {
     Write-Log "web-restart: stopping desktop ($($desktop.Count) processes)"
-    $desktop | Stop-Process -Force
+    $desktop | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 6
   }
 }
