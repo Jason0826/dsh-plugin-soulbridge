@@ -1,4 +1,4 @@
-﻿# 花在哪儿了（宿主侧运维记录）
+# 花在哪儿了（宿主侧运维记录）
 
 > **这份文档不属于 soulbridge。** soulbridge 是记忆与人格层（`packages/core` 里没有一行成本逻辑）：
 > 它存"发生了什么"，不记"这值多少钱"。用量与账单是**宿主的运维数据**，所以放在这个仓库：
@@ -11,7 +11,7 @@
 
 | 谁 | 记什么 | 落点 |
 |---|---|---|
-| 插件（`index.js` 的 `turn-cost`） | 每轮：请求数、步骤数、失败重试、插件自己的调用、四类 token、耗时、结束原因 | `~/.soulbridge/trace.jsonl`；一轮 ≥30 次请求时另打一行到 `plugin.log` |
+| 插件（`index.js` 的 `turn-cost`） | 每轮：请求数、步骤数、失败重试、插件自己的调用、四类 token、`mainMax`（宿主单请求最大前缀）、耗时、结束原因 | `~/.soulbridge/trace.jsonl`；一轮 ≥30 次请求时另打一行到 `plugin.log` |
 | `scripts/billing.mjs` | 每天：金额、请求数、三类 token，以及按导出单价重算的复核值 | 终端 |
 
 **插件不估金额。** 价目有峰谷两档（导出里同一 token 类出现两个单价）且会变，抄一份进代码
@@ -56,7 +56,7 @@ node scripts/billing.mjs --json             # 给程序读
 | `turn cost: session=… turn=… requests=N (steps=S failed=F plugin=P)` | 这一轮到了 30 次请求 |
 | `{"event":"turn-cost",…}`（trace） | 每轮一条，字段见上表 |
 
-## 主动建议（2026-11-05 提醒换会话；2026-11-06 泛化为触发器注册表，[0018](https://github.com/Jason0826/soulbridge/blob/main/docs/briefs/0018-behaviour-influence.md)；2026-11-07 加成本模型与压缩预算）
+## 主动建议（2026-11-05 提醒换会话；2026-11-06 泛化为触发器注册表，[0018](https://github.com/Jason0826/soulbridge/blob/main/docs/briefs/0018-behaviour-influence.md)；2026-11-07 加成本模型与压缩预算；2026-11-07 闸门改读真实上下文 mainMax）
 
 同一条 `turn-cost` 记录还回答另一个问题：**这个会话还能不能继续开下去**。
 
@@ -69,8 +69,12 @@ node scripts/billing.mjs --json             # 给程序读
   行 switch-session    每请求 ≥ 300k 或 轮数 ≥ 100 → 换会话提醒，
                        措辞是「优先 /compact，反复压缩或变慢再新开」
 节奏     每行每级一次；翻倍（400k / 600k…）才再说——不是每轮都说
-账本     compaction/end → sessionLedger.compact()：重置上下文弧（prompt/requests
-        归零，轮数保留作年龄守卫），重新武装 200k 线——否则压缩后继续报旧账
+信号     闸门读 mainMax（本轮宿主主请求的最大前缀 = 真实上下文），不读弧平均：
+        跨轮平均是滞后统计——2026-11-07 实测弧 141k、真值 245k，200k 线
+        连哑五轮；且弧里混着插件自己的小模型调用（插件调用不骑会话上下文）。
+        mainMax 缺失的旧记录回退弧平均。轮成本算钱仍用全量四类 token（钱是钱）
+账本     compaction/end → sessionLedger.compact()：重置上下文弧（prompt/requests/
+        mainMax 归零，轮数保留作年龄守卫），重新武装 200k 线——否则压缩后继续报旧账
         （turn 14 实测 27k 却报 350k，虚报 13 倍）
         plugin.log 一行  ledger: compaction observed, context arc reset (compactions=N)
         trace 一条      {"event":"ledger-compact","session":…,"compactions":N}

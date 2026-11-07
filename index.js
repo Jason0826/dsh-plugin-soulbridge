@@ -105,6 +105,12 @@ const TURN_TRACKER_MAX = 64;
  *   assistant/message   a finished call, with the usage it reported
  *   turn/start, turn/end  the window
  *
+ * Each assistant/message's usage is that call's own full prefix, so the record
+ * also carries `mainMax` — the largest host request of the turn. That is the
+ * true context size: the summed token fields mix in the plugin's small model
+ * calls and, averaged over a session arc, lag the live request (0018 gate fix,
+ * 2026-11-07).
+ *
  * A subagent runs in its own session and therefore gets its own record; the
  * event stream has no parent link, and guessing one would be worse than two
  * honest lines. Money is deliberately absent — prices have peak/off-peak tiers
@@ -148,6 +154,9 @@ export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns
       cacheHit: entry.cacheHit,
       cacheWrite: entry.cacheWrite,
       output: entry.output,
+      // Largest host request's full prefix: the true context, plugin calls
+      // excluded. 0 means no host message reported usage this turn.
+      mainMax: entry.mainMax,
       secs,
       ...(complete ? {} : { open: true }),
       ...(reason === undefined ? {} : { reason }),
@@ -189,6 +198,7 @@ export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns
           cacheHit: 0,
           cacheWrite: 0,
           output: 0,
+          mainMax: 0,
         });
         if (open.size > maxTurns) {
           const oldest = open.keys().next().value;
@@ -199,7 +209,20 @@ export function createTurnCostTracker({ threshold = TURN_REQUEST_ALERT, maxTurns
       if (!entry || entry.turn !== data.turn) return;
       if (type === 'step/start') entry.steps += 1;
       else if (type === 'assistant/attempt') entry.failed += 1;
-      else if (type === 'assistant/message') addUsage(entry, data.usage);
+      else if (type === 'assistant/message') {
+        addUsage(entry, data.usage);
+        // The largest single host request in the turn — one call's full prefix,
+        // which is the true context a gate should read. The summed counters mix
+        // in plugin calls (small, ours) and average across the arc, so they lag
+        // reality: on 2026-11-07 the arc read 141k while the live request carried
+        // 245k and the 200k line never fired. observe() only ever sees host
+        // events; plugin usage arrives through pluginUsage() and is excluded.
+        const prefix =
+          (Number(data.usage?.inputTokens) || 0) +
+          (Number(data.usage?.cacheReadTokens) || 0) +
+          (Number(data.usage?.cacheWriteTokens) || 0);
+        if (prefix > entry.mainMax) entry.mainMax = prefix;
+      }
       else if (type === 'turn/end') {
         finish(session, entry, data.reason?.kind, event?.time ?? Date.now(), true);
       }
@@ -383,6 +406,11 @@ export const PROACTIVE_TRIGGERS = [
  * fallback. Crossing again by a doubling is worth saying again; saying it every turn
  * is wallpaper. compact() restarts the context arc: without it the ledger averages
  * pre-compact prompts (turn 14 reported 350k while the session sat at 27k).
+ *
+ * The context a row levels against is `mainMax` — the latest turn's largest host
+ * request — not the arc average: averaging across turns lags the live request (on
+ * 2026-11-07 the arc read 141k at a true 245k and the line never fired). The arc
+ * stays as the fallback for records written before mainMax existed.
  */
 export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
   const cost = new Map();
@@ -392,12 +420,17 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
     note(record) {
       const id = String(record?.session ?? 'default');
       const stats =
-        cost.get(id) ?? { turns: 0, requests: 0, prompt: 0, compactions: 0, recentRequests: [] };
+        cost.get(id) ??
+        { turns: 0, requests: 0, prompt: 0, mainMax: 0, compactions: 0, recentRequests: [] };
       stats.turns += 1;
       const requests = Number(record?.requests) || 0;
       stats.requests += requests;
       stats.prompt +=
         (Number(record?.input) || 0) + (Number(record?.cacheHit) || 0) + (Number(record?.cacheWrite) || 0);
+      // The true context, latest turn wins: a turn with no host message (usage
+      // never reported) keeps the previous reading rather than erasing it.
+      const mainMax = Number(record?.mainMax) || 0;
+      if (mainMax > 0) stats.mainMax = mainMax;
       // Rolling requests/turn: the cost render prices per turn, and the pattern is
       // task style — it survives compaction, unlike the context arc below.
       stats.recentRequests ??= [];
@@ -409,8 +442,10 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
     },
     /**
      * The host compacted: restart the context arc so the 200k line re-arms, and count
-     * the compaction for compact-limit. turns survives (age guard) and recentRequests
-     * survives (task style). Returns the new count so the caller can trace it.
+     * the compaction for compact-limit. mainMax goes with it — the stale pre-compact
+     * reading must not fire the line again from inside the post-compact window.
+     * turns survives (age guard) and recentRequests survives (task style).
+     * Returns the new count so the caller can trace it.
      */
     compact(sessionId) {
       const id = String(sessionId ?? 'default');
@@ -419,6 +454,7 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       stats.compactions = (stats.compactions ?? 0) + 1;
       stats.prompt = 0;
       stats.requests = 0;
+      stats.mainMax = 0;
       // Re-arm only the compact line: its level is arc-derived. switch-session's level
       // is also age-derived (turns), and repeated-compaction advice now belongs to
       // compact-limit — leave that gate consumed.
@@ -430,16 +466,21 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
       const id = String(sessionId ?? 'default');
       const stats = cost.get(id);
       if (!stats || stats.requests === 0) return null;
-      const perRequest = stats.prompt / stats.requests;
+      // The gate reads the true context: the latest turn's largest host request.
+      // The arc average (prompt/requests) is a lagging statistic — during the
+      // 2026-11-07 climb it read 141k while the live request carried 245k, so
+      // the 200k line stayed silent for five turns. It remains the fallback for
+      // records written before mainMax existed.
+      const context = stats.mainMax > 0 ? stats.mainMax : stats.prompt / stats.requests;
       for (const trigger of triggers) {
-        const level = trigger.level(stats, perRequest);
+        const level = trigger.level(stats, context);
         if (level < 1 || level <= (reminded.get(`${id}:${trigger.id}`) ?? 0)) continue;
         reminded.set(`${id}:${trigger.id}`, level);
         return {
           id: trigger.id,
           action: trigger.action,
-          block: trigger.render(stats, perRequest),
-          trigger: Math.round(perRequest),
+          block: trigger.render(stats, context),
+          trigger: Math.round(context),
         };
       }
       return null;

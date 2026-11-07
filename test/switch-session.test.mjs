@@ -133,6 +133,28 @@ test('a compaction resets the arc: the stale-350k bug (2026-11-07)', () => {
   assert.equal(ledger.due('s1'), null, 'once per level, as always');
 });
 
+test('the gate reads the true context, not the arc average (the 2026-11-07 miss)', () => {
+  const ledger = createSessionLedger();
+  // The arc across earlier turns averaged under the line...
+  ledger.note({ session: 's1', requests: 20, cacheHit: 2_800_000 }); // 140k/request
+  assert.equal(ledger.due('s1'), null, 'the arc is below 200k — the old gate stayed silent');
+  // ...while the latest turn's largest host request really carried 221k.
+  ledger.note({ session: 's1', requests: 22, input: 100_000, cacheHit: 4_640_000, mainMax: 221_000 });
+  const fire = ledger.due('s1');
+  assert.equal(fire?.id, 'context-compact', 'the true context crossed the line');
+  assert.equal(fire.trigger, 221_000, 'the trace carries the value that fired');
+  assert.match(fire.block, /context-per-request="221000"/);
+});
+
+test('compaction clears the true-context reading, not just the arc', () => {
+  const ledger = createSessionLedger();
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000, mainMax: 205_000 });
+  assert.equal(ledger.due('s1').id, 'context-compact');
+  ledger.compact('s1');
+  ledger.note({ session: 's1', requests: 1, input: 1_000 }); // fresh arc, no host reading yet
+  assert.equal(ledger.due('s1'), null, 'the stale 205k must not fire inside the fresh arc');
+});
+
 test('two compactions spend the budget: the next 200k crossing advises switching', () => {
   const ledger = createSessionLedger();
   ledger.note({ session: 's1', requests: 4, cacheHit: 800_000 }); // 200k

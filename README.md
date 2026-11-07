@@ -102,12 +102,15 @@ DSH 启动器对 `package.json` 直接 `JSON.parse`，不剥 BOM。用 Windows P
 
 | 落点 | 什么时候 | 内容 |
 |---|---|---|
-| `trace.jsonl` 的 `{"event":"turn-cost"}` | 每轮结束 | 请求数（= 步骤 + 失败尝试 + 插件自己的调用）、四类 token、耗时、结束原因 |
+| `trace.jsonl` 的 `{"event":"turn-cost"}` | 每轮结束 | 请求数（= 步骤 + 失败尝试 + 插件自己的调用）、四类 token、`mainMax`（宿主单请求最大前缀 = 真实上下文）、耗时、结束原因 |
 | `plugin.log` 的 `turn cost:` | 一轮 ≥ 30 次请求 | 同一份数字压成一行 |
 
 计数来源是宿主的事件流：`step/start`（一次调用）、`assistant/attempt`（重试且没出消息）、
-`assistant/message.usage`（token）。子代理跑在自己的会话里，因此各自一条记录——事件流
-里没有父子关系，猜一个比写两条更坏。
+`assistant/message.usage`（token）。每次 `assistant/message` 的 usage 是**那一次调用自己的
+完整前缀**，所以记录里有 `mainMax`（本轮宿主请求的最大值）——主动建议的闸门读它，不读跨轮
+弧平均（平均滞后实况，2026-11-07 实测弧 141k 真值 245k 连哑五轮）；插件自己的模型调用不进
+mainMax（不骑会话上下文），但照常计入请求数与 token 总量。子代理跑在自己的会话里，因此各自
+一条记录——事件流里没有父子关系，猜一个比写两条更坏。
 
 插件**不算钱**（价目有峰谷两档且会变）。账单是另一件事，也只属于宿主侧的运维：
 

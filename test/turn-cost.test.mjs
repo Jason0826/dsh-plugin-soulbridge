@@ -68,6 +68,7 @@ test('a finished turn reports its requests, tokens and duration', () => {
       cacheHit: 10_000,
       cacheWrite: 0,
       output: 60,
+      mainMax: 9_100,
       secs: 5,
       reason: 'completed',
     },
@@ -117,6 +118,24 @@ test('a plugin call lands on the current turn and carries its usage', () => {
   assert.equal(records[0].requests, 2);
   assert.equal(records[0].input, 700);
   assert.equal(records[0].output, 80);
+});
+
+test('mainMax is the largest host request — plugin calls are not context', () => {
+  const { tracker, records } = harness();
+  tracker.observe('s1', startTurn(9));
+  tracker.observe('s1', step(9));
+  tracker.observe('s1', message(9, usage(50, 100_000, 10))); // prefix 100_050
+  tracker.pluginCall();
+  // Bigger than the host's largest request — a fresh post-compact session (27k
+  // main) with a large extract call is the real shape of this edge. The plugin
+  // call does not ride the session context, so it must never win.
+  tracker.pluginUsage(usage(700, 300_000, 80)); // prefix 300_700
+  tracker.observe('s1', step(9));
+  tracker.observe('s1', message(9, usage(60, 200_000, 10))); // prefix 200_060
+  tracker.observe('s1', endTurn(9));
+  assert.equal(records[0].mainMax, 200_060, 'the gate reads host requests only');
+  assert.equal(records[0].plugin, 1, 'the plugin call is still counted as a request');
+  assert.equal(records[0].input, 810, 'token totals stay complete — money is money');
 });
 
 test("another session's events are not attached to the open turn", () => {
