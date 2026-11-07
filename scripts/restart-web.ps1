@@ -2,8 +2,9 @@
 #
 # Why not just launch `dsh web`: the host is the action of the DshWebHost scheduled task, so
 # stopping/starting the task replaces it cleanly. The task is a launcher, not a supervisor:
-# it has been observed to record 0xC000013A and end while the host lives on as an orphan, so
-# nothing here may assume "the task is Running" means "the host is alive".
+# it has been seen recording 0xC000013A and ending while the host lived on as an orphan, so
+# nothing here may assume "the task is Running" means "the host is alive". Stopping the task
+# and then waiting for the process tree to actually disappear is the only safe replace.
 #
 # Why the .url file: every start mints a new launch token and the browser cookie from the
 # previous start is invalid. Writing the new token URL into a shortcut means a restart does
@@ -14,14 +15,25 @@
 # exactly while the host runs -- which is when the interesting lines are written (ready /
 # FAILED) -- so those lines were silently lost: 25 starts on record, 0 "ready at" lines
 # (2026-11-07). Restart bookkeeping goes to web-restart.log; web-host.log stays the host's.
+#
+# Exit codes, because a restart loop needs to tell "it worked" from "it was refused":
+#   0  host is up and the URL was published
+#   2  another restart held the lock for the whole LockWaitSeconds
+#   3  the task was started but no token URL appeared within WaitSeconds
+#   4  the review gate refused (health-check --gate=review is red)
 param(
   [int]$Port = 3080,
   [int]$DelaySeconds = 0,
-  [int]$WaitSeconds = 90,
+  [int]$WaitSeconds = 120,
+  # A restart asked for while another one runs waits for it instead of being dropped.
+  [int]$LockWaitSeconds = 180,
+  # The review gate is re-used while it is this fresh: a dev loop restarts far more often
+  # than the review can meaningfully change. A red gate still re-runs every time.
+  [int]$GateMaxAgeSeconds = 300,
   [string]$TaskName = 'DshWebHost',
   [string]$ProcessName = 'DeepSeek Harness',
-  # Only pass this when a desktop window is actually open: matching the image name alone would
-  # also hit the web host this script is about to replace.
+  # Only needed if a desktop window is open: matching the image name alone would also hit the
+  # web host this script is replacing.
   [switch]$StopDesktop,
   # Only opens a browser tab when asked. Unattended restarts must not leave dead tabs behind.
   [switch]$OpenBrowser,
@@ -36,6 +48,12 @@ $log = Join-Path $homeDir 'web-host.log'
 $restartLog = Join-Path $homeDir 'web-restart.log'
 $urlFile = Join-Path $homeDir 'web-url.txt'
 $shortcut = Join-Path $homeDir 'DSH-Web.url'
+$gateStamp = Join-Path $homeDir 'web-restart-gate.stamp'
+$lockFile = Join-Path $homeDir 'web-restart.lock'
+
+$exitBusy = 2
+$exitNotReady = 3
+$exitGateRed = 4
 
 function Write-Log([string]$message) {
   $line = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $message
@@ -47,113 +65,168 @@ function Write-Log([string]$message) {
   }
 }
 
+# Every process that could still own this port: listeners, plus anything still holding the
+# command line (a host that started but has not bound the port yet would otherwise be missed,
+# and the next start would put a second host beside it).
 function Get-HostPids {
-  $pids = @()
+  $ids = @()
   foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
-    if ($conn.OwningProcess -gt 0) { $pids += [int]$conn.OwningProcess }
+    if ($conn.OwningProcess -gt 0) { $ids += [int]$conn.OwningProcess }
   }
-  return $pids | Select-Object -Unique
+  $pattern = "--port\s+$Port(\s|$)"
+  foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    if (-not $proc.CommandLine) { continue }
+    if ($proc.CommandLine -match $pattern) { $ids += [int]$proc.ProcessId }
+  }
+  return $ids | Select-Object -Unique
 }
 
-if ($DelaySeconds -gt 0) {
-  Write-Log "web-restart: waiting ${DelaySeconds}s"
-  Start-Sleep -Seconds $DelaySeconds
-}
+$lockHeld = $false
 
-# 0. Refuse to deploy without the review the checklist asks for.
-#
-# The health-check review gate fires after commits, while the habit was to run health-check
-# before committing — so it was always green at the moment someone looked and red afterwards.
-# Putting it in front of the restart is the only place that cannot be skipped.
-#
-# The decision is an exit code, not a string match: the first version matched '✗ [review]' in
-# the captured output, and PowerShell 5.1 decodes that child output with the system code page,
-# so the regex matched a PASS line and refused a clean deploy (2026-11-04 11:21).
-$repoRoot = 'D:\git-workspace\repos\soulbridge'
-$healthScript = Join-Path $repoRoot 'scripts\health-check.mjs'
-if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
-  $cmd = Get-Command node -ErrorAction SilentlyContinue
-  $node = if ($cmd) { $cmd.Source } else { $null }
-  if (-not $node -and (Test-Path 'C:\Program Files\nodejs\node.exe')) { $node = 'C:\Program Files\nodejs\node.exe' }
-  if ($node) {
-    $null = & $node $healthScript --no-tests --gate=review 2>&1
-    if ($LASTEXITCODE -ne 0) {
-      Write-Log 'web-restart: REFUSED - the review gate is red (write a docs/audit review first)'
-      exit 1
+try {
+  # 0. One restart at a time. The task engine drops a second Start-ScheduledTask silently
+  #    (MultipleInstances=IgnoreNew), so a dev loop that restarts too fast must queue here
+  #    and say so, not look like it restarted when it did nothing.
+  $lockDeadline = (Get-Date).AddSeconds($LockWaitSeconds)
+  while (-not $lockHeld -and (Get-Date) -lt $lockDeadline) {
+    try {
+      $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes("$PID $(Get-Date -Format o)")
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Close()
+      $lockHeld = $true
+    } catch {
+      # A lock whose owner is gone is a leftover, not a running restart.
+      $ownerId = 0
+      try {
+        $ownerText = Get-Content $lockFile -ErrorAction Stop | Select-Object -First 1
+        if ($ownerText) { $ownerId = [int](($ownerText -split ' ')[0]) }
+      } catch { }
+      if ($ownerId -gt 0 -and -not (Get-Process -Id $ownerId -ErrorAction SilentlyContinue)) {
+        Write-Log "lock: clearing stale lock of pid $ownerId"
+        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+        continue
+      }
+      Start-Sleep -Seconds 2
     }
-    Write-Log 'web-restart: review gate ok'
-  } else {
-    Write-Log 'web-restart: node not on PATH; review gate skipped'
   }
-}
 
-# 1. Desktop and web host are one executable: dsh.cmd runs "DeepSeek Harness.exe" with
-#    ELECTRON_RUN_AS_NODE=1, so both answer to the same image name and share one Runtime.
-#    Killing by image name alone therefore also hits the web host, and would close a desktop
-#    window nobody asked this script to touch. Do it only on request, and only for real
-#    desktop processes (they run the app, not cli.js).
-if ($StopDesktop) {
-  $desktop = @(Get-CimInstance Win32_Process -Filter "Name='$ProcessName.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -notmatch 'cli\.js' })
-  if ($desktop.Count -gt 0) {
-    Write-Log "web-restart: stopping desktop ($($desktop.Count) processes)"
-    $desktop | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 6
+  if (-not $lockHeld) {
+    Write-Log "BUSY - another restart still holds $lockFile after ${LockWaitSeconds}s"
+    exit $exitBusy
   }
-}
 
-# 2. Stop the previous host: the task first (it owns the tree), then any straggler on the port.
-$before = (Get-Content $log -ErrorAction SilentlyContinue | Measure-Object).Count
-$existing = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
-if ($existing.Count -gt 0) {
-  Write-Log "web-restart: stopping task $TaskName"
-  try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch { }
-  Start-Sleep -Seconds 3
-}
-foreach ($pid in Get-HostPids) {
-  Write-Log "web-restart: killing pid $pid still on port $Port"
-  Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
-}
-Start-Sleep -Seconds 1
-
-# 3. Start it and wait for the new token line.
-Write-Log "web-restart: starting task $TaskName"
-Start-ScheduledTask -TaskName $TaskName
-
-$url = $null
-for ($waited = 0; $waited -lt $WaitSeconds; $waited += 2) {
-  Start-Sleep -Seconds 2
-  $listening = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue).Count
-  if ($listening -eq 0) { continue }
-  $line = Get-Content $log -ErrorAction SilentlyContinue |
-    Select-Object -Skip $before |
-    Where-Object { $_ -match "dsh web: http://127\.0\.0\.1:$Port/\?token=" } |
-    Select-Object -Last 1
-  if ($line) {
-    $url = ($line -split 'dsh web: ')[1].Trim()
-    break
+  if ($DelaySeconds -gt 0) {
+    Write-Log "waiting ${DelaySeconds}s"
+    Start-Sleep -Seconds $DelaySeconds
   }
+
+  # 1. Refuse to deploy without the review the checklist asks for, unless that review is
+  #    still fresh. The decision is an exit code, not a string match: PowerShell 5.1 decodes
+  #    child output with the system code page, and a regex on that once refused a clean deploy.
+  $repoRoot = 'D:\git-workspace\repos\soulbridge'
+  $healthScript = Join-Path $repoRoot 'scripts\health-check.mjs'
+  if ((Test-Path $healthScript) -and -not $SkipReviewGate) {
+    $gateAge = [double]::MaxValue
+    if (Test-Path $gateStamp) { $gateAge = ((Get-Date) - (Get-Item $gateStamp).LastWriteTime).TotalSeconds }
+    if ($gateAge -lt $GateMaxAgeSeconds) {
+      Write-Log "gate: reusing a green review $([int]$gateAge)s old"
+    } else {
+      $cmd = Get-Command node -ErrorAction SilentlyContinue
+      $node = if ($cmd) { $cmd.Source } else { $null }
+      if (-not $node -and (Test-Path 'C:\Program Files\nodejs\node.exe')) { $node = 'C:\Program Files\nodejs\node.exe' }
+      if ($node) {
+        $null = & $node $healthScript --no-tests --gate=review 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          Write-Log 'REFUSED - the review gate is red (write a docs/audit review first)'
+          exit $exitGateRed
+        }
+        Set-Content -Path $gateStamp -Value (Get-Date -Format o) -Encoding utf8
+        Write-Log 'gate: ok'
+      } else {
+        Write-Log 'gate: node not on PATH, skipped'
+      }
+    }
+  }
+
+  # 2. One runtime, one client: an actual desktop window has to go first. Kill by image name
+  #    alone and the web host dies too, so only do it on request and only for real desktop
+  #    processes (they run the app, not cli.js).
+  if ($StopDesktop) {
+    $desktop = @(Get-CimInstance Win32_Process -Filter "Name='$ProcessName.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -and $_.CommandLine -notmatch 'cli\.js' })
+    if ($desktop.Count -gt 0) {
+      Write-Log "stopping desktop ($($desktop.Count) processes)"
+      $desktop | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+      Start-Sleep -Seconds 6
+    }
+  }
+
+  # 3. Stop the previous host and wait for it to really be gone. A fixed sleep is a guess:
+  #    start too early next to a dying process and the port is taken twice.
+  $before = @(Get-Content $log -ErrorAction SilentlyContinue).Count
+  $existing = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+  if ($existing.Count -gt 0) {
+    Write-Log "stopping task $TaskName"
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch { }
+  }
+
+  $stopDeadline = (Get-Date).AddSeconds(20)
+  while ($true) {
+    $remaining = @(Get-HostPids)
+    if ($remaining.Count -eq 0) { break }
+    if ((Get-Date) -gt $stopDeadline) {
+      foreach ($hostPid in $remaining) {
+        Write-Log "killing pid $hostPid that outlived the task stop"
+        Stop-Process -Id $hostPid -Force -ErrorAction SilentlyContinue
+      }
+      Start-Sleep -Seconds 2
+      break
+    }
+    Start-Sleep -Milliseconds 500
+  }
+
+  # 4. Start it and wait for a token line printed after the stop, so a stale line from the
+  #    previous process cannot be handed back as if it were the new one.
+  Write-Log "starting task $TaskName"
+  Start-ScheduledTask -TaskName $TaskName
+
+  $url = $null
+  for ($waited = 0; $waited -lt $WaitSeconds; $waited += 2) {
+    Start-Sleep -Seconds 2
+    $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
+    if ($lines.Count -le $before) { continue }
+    $fresh = @($lines[$before..($lines.Count - 1)] |
+      Where-Object { $_ -match "dsh web: http://127\.0\.0\.1:$Port/\?token=" })
+    if ($fresh.Count -gt 0) {
+      $url = ($fresh[-1] -split 'dsh web: ')[1].Trim()
+      break
+    }
+  }
+
+  if (-not $url) {
+    Write-Log "NOT READY - no token URL on port $Port within ${WaitSeconds}s"
+    exit $exitNotReady
+  }
+
+  # 5. Persist it where a restart needs only one click. The supervisor does this too when it
+  #    restarts a crashed host; both write the same files, so either path leaves it current.
+  Set-Content -Path $urlFile -Value $url -Encoding utf8
+  @(
+    '[InternetShortcut]'
+    "URL=$url"
+  ) | Set-Content -Path $shortcut -Encoding ascii
+  Write-Log "ready at $url (shortcut: $shortcut)"
+
+  # Opening a tab is opt-in: the token URL changes on every restart, so the old tab cannot be
+  # reused -- but auto-opening on every unattended restart left a browser full of dead tabs.
+  if ($OpenBrowser) {
+    Start-Process $url | Out-Null
+    Write-Log 'opened browser'
+  }
+
+  exit 0
 }
-
-if (-not $url) {
-  Write-Log "web-restart: FAILED - no token URL on port $Port within ${WaitSeconds}s"
-  exit 1
+finally {
+  if ($lockHeld) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
 }
-
-# 4. Persist it where a restart needs only one click.
-Set-Content -Path $urlFile -Value $url -Encoding utf8
-@(
-  '[InternetShortcut]'
-  "URL=$url"
-) | Set-Content -Path $shortcut -Encoding ascii
-Write-Log "web-restart: ready at $url (shortcut: $shortcut)"
-
-# Opening a tab is opt-in: the token URL changes on every restart, so the old tab cannot be
-# reused — but auto-opening on every unattended restart left a browser full of dead tabs.
-# The shortcut is always rewritten, so a human needs one click only when they want one.
-if ($OpenBrowser) {
-  Start-Process $url | Out-Null
-  Write-Log 'web-restart: opened browser'
-}
-
-exit 0
