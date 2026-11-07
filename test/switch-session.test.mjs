@@ -17,7 +17,7 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-switch-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { createSessionLedger, renderSwitchSession, renderContextCompact, renderCompactLimit, PROACTIVE_TRIGGERS } =
+const { createSessionLedger, rebuildLedger, renderSwitchSession, renderContextCompact, renderCompactLimit, PROACTIVE_TRIGGERS } =
   await import('../index.js');
 
 test('below the threshold nothing is said', () => {
@@ -153,6 +153,48 @@ test('compaction clears the true-context reading, not just the arc', () => {
   ledger.compact('s1');
   ledger.note({ session: 's1', requests: 1, input: 1_000 }); // fresh arc, no host reading yet
   assert.equal(ledger.due('s1'), null, 'the stale 205k must not fire inside the fresh arc');
+});
+
+test('a restart does not forget the compaction budget (rebuild from trace)', () => {
+  const ledger = createSessionLedger();
+  const records = [
+    { event: 'turn-cost', session: 's1', requests: 4, input: 100, cacheHit: 100_000, mainMax: 105_000 },
+    { event: 'turn-cost', session: 's1', requests: 4, cacheHit: 800_000, mainMax: 202_000 },
+    { event: 'ledger-compact', session: 's1', compactions: 1 },
+    { event: 'turn-cost', session: 's1', requests: 4, cacheHit: 800_000, mainMax: 202_000 },
+    { event: 'ledger-compact', session: 's1', compactions: 2 },
+    { event: 'turn-cost', session: 's1', requests: 4, cacheHit: 800_000, mainMax: 204_000 },
+    null, // a corrupt line costs one event, not the rebuild
+    { event: 'segment-seal', outcome: 'ok' }, // unknown events are not ledger facts
+  ];
+  const replayed = rebuildLedger(ledger, records);
+  assert.equal(replayed.turns, 4, 'four turn-cost records replayed');
+  assert.equal(replayed.compactions, 2, 'both compactions replayed');
+  const fire = ledger.due('s1');
+  assert.equal(
+    fire?.id,
+    'compact-limit',
+    'budget spent before the restart: the limit row owns the line, not a third compact',
+  );
+  assert.match(fire.block, /compactions="2"/);
+});
+
+test('a compaction for a session the ledger never saw still counts (A9 finding)', () => {
+  const ledger = createSessionLedger();
+  assert.equal(ledger.compact('ghost'), 1, 'a compaction is a fact before the first turn-cost record');
+  assert.equal(ledger.due('ghost'), null, 'no context to advise on yet');
+});
+
+test('a lost trace line under-counts by the gap, not compounding', () => {
+  const ledger = createSessionLedger();
+  rebuildLedger(ledger, [
+    { event: 'turn-cost', session: 's1', requests: 2, cacheHit: 400_000 },
+    { event: 'ledger-compact', session: 's1', compactions: 3 }, // two events missing from the file
+  ]);
+  ledger.note({ session: 's1', requests: 4, cacheHit: 800_000, mainMax: 201_000 });
+  const fire = ledger.due('s1');
+  assert.equal(fire?.id, 'compact-limit', 'the absolute count in the event wins');
+  assert.match(fire.block, /compactions="3"/);
 });
 
 test('two compactions spend the budget: the next 200k crossing advises switching', () => {

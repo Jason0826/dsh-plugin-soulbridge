@@ -449,8 +449,12 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
      */
     compact(sessionId) {
       const id = String(sessionId ?? 'default');
-      const stats = cost.get(id);
-      if (!stats) return 0;
+      // A compaction is a fact even for a session the ledger never saw — counting
+      // it keeps the budget honest when the event beats the first turn-cost record,
+      // or when a rebuild replays compactions before any turn (A9 finding closed).
+      const stats =
+        cost.get(id) ??
+        { turns: 0, requests: 0, prompt: 0, mainMax: 0, compactions: 0, recentRequests: [] };
       stats.compactions = (stats.compactions ?? 0) + 1;
       stats.prompt = 0;
       stats.requests = 0;
@@ -490,6 +494,50 @@ export function createSessionLedger({ triggers = PROACTIVE_TRIGGERS } = {}) {
 
 /** One ledger for the running host: a session is remembered across pre-steps. */
 const sessionLedger = createSessionLedger();
+/** Rebuild runs once per process; a reload keeps the live ledger as it is. */
+let ledgerRebuilt = false;
+
+/**
+ * Replay trace records into a ledger — a restart must not forget the compaction
+ * budget. The ledger is in-memory, so without this every restart resets
+ * compactions to 0 and the next 200k crossing advises a third compact instead of
+ * the switch a spent budget demands (the user compacted twice on 2026-11-07; a
+ * restart would have argued for a summary of a summary). The trace already holds
+ * every fact the ledger holds — this replays them in file order, so the derived
+ * state stays rebuildable from the one record.
+ *
+ * `reminded` (once-per-level) is deliberately not replayed: the proactive event
+ * carries the context value, not the level. A restart right after advice may say
+ * it once more; the advice is still true, and compactions — the correctness-
+ * critical number — is exact.
+ *
+ * @param {ReturnType<typeof createSessionLedger>} ledger
+ * @param {object[]} records - parsed trace lines, oldest first.
+ * @returns {{turns: number, compactions: number}} what was replayed, for the log line.
+ */
+export function rebuildLedger(ledger, records) {
+  let turns = 0;
+  let compactions = 0;
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    if (record.event === 'turn-cost') {
+      ledger.note(record);
+      turns += 1;
+    } else if (record.event === 'ledger-compact') {
+      // compact() increments; the event carries the absolute count. Reconcile so
+      // a lost trace line under-counts by the gap once, never compounding.
+      let count = ledger.compact(record.session);
+      const target = Number(record.compactions) || count;
+      let guard = 0;
+      while (count < target && guard < 100) {
+        count = ledger.compact(record.session);
+        guard += 1;
+      }
+      compactions += 1;
+    }
+  }
+  return { turns, compactions };
+}
 
 /** Prompt assembly can run several times per step; do not hit SQLite every time. */
 
@@ -3049,6 +3097,33 @@ export function apply(ctx) {
   writeState({ appliedAt: Date.now(), version: VERSION });
   selfCheck();
 
+  // A restart starts an empty ledger: replay the trace so the compaction budget,
+  // the context arc and the turn count survive (0.0.125). Without it the first
+  // 200k crossing after a restart would advise compacting a spent budget again.
+  if (!ledgerRebuilt) {
+    ledgerRebuilt = true;
+    try {
+      if (existsSync(TRACE_FILE)) {
+        const records = readFileSync(TRACE_FILE, 'utf8')
+          .split('\n')
+          .map((line) => {
+            try {
+              return line ? JSON.parse(line) : null;
+            } catch {
+              return null; // a corrupt line costs one event, not the rebuild
+            }
+          })
+          .filter(Boolean);
+        const replayed = rebuildLedger(sessionLedger, records);
+        log(
+          `ledger: rebuilt from trace (turn-cost=${replayed.turns}` +
+            ` ledger-compact=${replayed.compactions})`,
+        );
+      }
+    } catch (error) {
+      log(`ledger: trace rebuild failed (${error instanceof Error ? error.message : error}); starting empty`);
+    }
+  }
 
   const config = readConfig();
   injectedLlm = makeLlm(ctx, config);

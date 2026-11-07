@@ -76,6 +76,12 @@ node scripts/billing.mjs --json             # 给程序读
 账本     compaction/end → sessionLedger.compact()：重置上下文弧（prompt/requests/
         mainMax 归零，轮数保留作年龄守卫），重新武装 200k 线——否则压缩后继续报旧账
         （turn 14 实测 27k 却报 350k，虚报 13 倍）
+        启动时 rebuildLedger 从 trace 重放（turn-cost→note、ledger-compact→compact
+        按事件里的绝对数对账；2.95MB 全量一遍）——账本是内存态，重启不清预算/弧/轮数，
+        否则下次过线会建议压缩已花光的预算（11-07 已压 2 次）。reminded 不重放
+        （proactive 事件只带 trigger 不带 level）→ 重启可能把仍有效的建议再说一次，
+        预算数精确；compact() 对未见过的会话也计数（A9 发现已关闭）
+        plugin.log 一行  ledger: rebuilt from trace (turn-cost=N ledger-compact=M)
         plugin.log 一行  ledger: compaction observed, context arc reset (compactions=N)
         trace 一条      {"event":"ledger-compact","session":…,"compactions":N}
 落点     pre-step 注入 <proactive id=…>，由模型转告用户
