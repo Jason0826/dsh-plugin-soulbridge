@@ -2183,8 +2183,9 @@ export async function drainExtractionQueue(options = {}) {
     const ok =
       outcome === 'ok' || outcome === 'skipped-off' || outcome === 'skipped-empty' || outcome === 'rules-mode';
     if (ok) {
-      // Promotion is decided after the facts exist: a corrected turn's lessons enter
-      // the classification queue here, which is the only live producer it has.
+      // Promotion is decided after the facts exist: every lesson of a drained turn
+      // enters the queue, bucketed by the signal that put it there (T1-修正 / 全收);
+      // late corrections are backfilled separately (0018 §九 3 A, 拍板 b).
       for (const { item } of taken) feedClassifyFromTurn(item.turnId);
       removeExtractItems(taken.map((entry) => entry.item.turnId));
       sealSegment({
@@ -2527,11 +2528,31 @@ export function hasMergeableGroup(queue) {
 const CLASSIFY_FILE = join(HOME, 'pending-classify.json');
 const CLASSIFY_BATCH = 10;
 
+/**
+ * Queue buckets, strongest evidence first. The order is the batch priority.
+ *
+ * `T1-修正` is a lesson the user corrected; `全收` is everything that entered because
+ * the gate is open (0018 §九 3, 拍板 b); `存量` is the backlog written before the
+ * queue had a producer. A weak reason must not starve a strong one: the cap is ten
+ * per step, so order is the difference between "classified next step" and "in a day".
+ */
+const CLASSIFY_BUCKETS = ['T1-修正', '全收', '存量'];
+
+function classifyBucketRank(reason) {
+  const at = CLASSIFY_BUCKETS.indexOf(String(reason ?? ''));
+  return at < 0 ? CLASSIFY_BUCKETS.length : at;
+}
+
 const readClassifyQueue = () => readQueueFile(CLASSIFY_FILE);
 const writeClassifyQueue = (queue) => writeQueueFile(CLASSIFY_FILE, queue, { cap: 400 });
 
+/** The next batch, strongest bucket first; within a bucket, arrival order. */
 export function peekClassifyBatch() {
-  return readClassifyQueue().slice(0, CLASSIFY_BATCH);
+  return readClassifyQueue()
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => classifyBucketRank(a.item.reason) - classifyBucketRank(b.item.reason) || a.index - b.index)
+    .slice(0, CLASSIFY_BATCH)
+    .map(({ item }) => item);
 }
 
 /** Remove items only after their result has been applied. */
@@ -2583,10 +2604,30 @@ export function enqueueClassifyCandidate(item) {
 }
 
 /**
- * T1 (brief 0023): a corrected turn's lessons are promoted, and nothing else is.
+ * Raise an item's bucket without queuing it twice.
  *
- * Being told you were wrong is the consequence an experience comes with, which is
- * the one promotion signal we can trust without a threshold. Everything else waits.
+ * A correction can arrive after the lesson was queued as 全收: the reason the row is
+ * waiting changed, and the queue file is the record of that (a duplicate would make
+ * the batch spend a slot on the same lesson twice).
+ */
+export function reBucketQueuedCandidate(id, reason) {
+  const queue = readClassifyQueue();
+  const at = queue.findIndex((item) => item.id === id);
+  if (at < 0 || queue[at].reason === reason) return false;
+  queue[at] = { ...queue[at], reason };
+  writeClassifyQueue(queue);
+  return true;
+}
+
+/**
+ * Every lesson of a drained turn enters the classification queue (0018 §九 3, 拍板 b).
+ *
+ * The gate used to be "a corrected turn, and nothing else" (0023 T1), so a lesson
+ * nobody ever corrected could never be classified — the SQLite date() trap is exactly
+ * that shape. The bucket now says why the item is here; the bucket order says how
+ * strong that reason is. A lesson still reaches the queue only if the model flagged
+ * it (role=lesson); whether it was said with `角色=lesson` or `原则候选=是` no longer
+ * matters, because both are written as candidates.
  */
 export function feedClassifyFromTurn(turnId) {
   try {
@@ -2594,19 +2635,74 @@ export function feedClassifyFromTurn(turnId) {
     // the queue until the cap drops it, so it is not queued at all.
     if (!usesModel(readConfig())) return 0;
     const soul = ensureSoul();
-    if (!soul.wasCorrectedTurn(turnId)) return 0;
+    const bucket = soul.wasCorrectedTurn(turnId) ? 'T1-修正' : '全收';
     let added = 0;
     for (const fact of soul.promotionCandidates(turnId)) {
-      if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: 'T1-修正' })) {
+      if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: bucket })) {
         added += 1;
       }
     }
-    if (added > 0) log(`promote: T1 corrected turn → ${added} candidate(s) queued for classification`);
-    trace({ event: 'promote', rule: 'T1', turn: turnId, queued: added });
+    if (added > 0) log(`promote: ${bucket} → ${added} candidate(s) queued for classification`);
+    trace({ event: 'promote', bucket, turn: turnId, queued: added });
     return added;
   } catch (error) {
     log(`promote: failed (${error instanceof Error ? error.message : String(error)})`);
     return 0;
+  }
+}
+
+/**
+ * A correction is evidence that arrives after the fact (0018 §九 3 A).
+ *
+ * The queue is fed at the departure point, but the correction is written the moment
+ * the user says "不对" — and the turn it targets may already have been drained, its
+ * lessons queued as 全收 or parked as 待修. So every correction re-checks the turns
+ * it points at, through its own two links (the user's words and the reply they
+ * corrected; never a time window, 0023 T1), and moves their candidate lessons to the
+ * front: a queued one is re-bucketed to T1-修正, a parked one gets a second pass.
+ *
+ * Without this the queue has a blind spot exactly where the signal is strongest:
+ * lessons extracted before the correction row existed were invisible to it.
+ */
+export function backfillClassifyFromCorrection(correction) {
+  const result = { turns: 0, queued: 0, reBucketed: 0 };
+  try {
+    if (!usesModel(readConfig())) return result;
+    const userText = String(correction?.userText ?? '').trim();
+    const assistantText = String(correction?.assistantText ?? '').trim();
+    if (userText.length === 0 && assistantText.length === 0) return result;
+    const soul = ensureSoul();
+    const linked = new Map();
+    for (const needle of [userText, assistantText]) {
+      if (needle.length === 0) continue;
+      for (const turn of soul.findTurns(needle, { limit: 10 }).turns) {
+        const matches =
+          (userText.length > 0 && turn.userText.trim() === userText) ||
+          (assistantText.length > 0 && turn.assistantText.trim() === assistantText);
+        if (matches) linked.set(turn.id, turn);
+      }
+    }
+    result.turns = linked.size;
+    for (const turnId of linked.keys()) {
+      for (const fact of soul.promotionCandidates(turnId)) {
+        if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: 'T1-修正' })) {
+          result.queued += 1;
+        } else if (reBucketQueuedCandidate(fact.id, 'T1-修正')) {
+          result.reBucketed += 1;
+        }
+      }
+    }
+    if (result.queued + result.reBucketed > 0) {
+      log(
+        `promote: correction backfill → turns=${result.turns} queued=${result.queued}` +
+          ` re-bucketed=${result.reBucketed}`,
+      );
+    }
+    trace({ event: 'classify-backfill', ...result });
+    return result;
+  } catch (error) {
+    log(`promote: correction backfill failed (${error instanceof Error ? error.message : String(error)})`);
+    return result;
   }
 }
 
@@ -2679,6 +2775,35 @@ async function runClassifyStep() {
   trace({ event: 'classify', batch: batch.length, rules, profiles, pending, reasons });
   return true;
 }
+
+/**
+ * The lessons extracted before the queue had a producer (0018 §九 3 A, 存量).
+ *
+ * One pass, through the queue's own writer (one writer, one cap: a script writing
+ * the file directly would bypass both), with a marker so a restart does not re-bill
+ * it. Capped by the queue's own cap rather than a second limit here — a drop is
+ * logged by the writer, so "how many were left behind" stays answerable.
+ */
+export function backfillClassifyBacklog() {
+  const marker = join(HOME, '.classify-backfill-done');
+  if (existsSync(marker)) return 0;
+  const config = readConfig();
+  if (config.extract === 'off' || !usesModel(config)) return 0;
+  let queued = 0;
+  try {
+    const soul = ensureSoul();
+    for (const fact of soul.promotionBacklog()) {
+      if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: '存量' })) queued += 1;
+    }
+    log(`classify backfill: ${queued} backlog lesson(s) queued (存量)`);
+    trace({ event: 'classify-backlog', queued });
+    writeFileSync(marker, new Date().toISOString());
+  } catch (error) {
+    log(`classify backfill failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return queued;
+}
+
 /**
  * One consolidation step per call, never two model calls in one step.
  *
@@ -3386,6 +3511,9 @@ export function apply(ctx) {
       // inside apply() where the llm lookup fails.
       if (kind === 'user') {
         void backfillExtraction();
+        // Same one-shot contract for the classification backlog: the lessons written
+        // before the queue had a producer are owed a pass (0018 §九 3 A, 存量).
+        backfillClassifyBacklog();
       }
 
       // Only the human's own prose. runtime-context / time-context / injected
@@ -3409,6 +3537,9 @@ export function apply(ctx) {
             rule: verdict.marker ? `${verdict.layer}:${verdict.marker}` : verdict.layer,
           });
           log(`correction recorded: ${id} layer=${verdict.layer} marker=${verdict.marker ?? '-'}`);
+          // The correction is evidence the queue may not have seen: the turn it
+          // targets can already be drained (0018 §九 3 A).
+          backfillClassifyFromCorrection({ userText: text, assistantText: lastAssistantText });
         } catch (error) {
           log(`correction failed: ${error instanceof Error ? error.message : String(error)}`);
         }

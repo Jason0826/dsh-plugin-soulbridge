@@ -1,10 +1,11 @@
 /**
- * T1 end to end, against a real database file (brief 0023).
+ * Promotion end to end, against a real database file (brief 0018 §九 3 A, 拍板 b).
  *
- * The unit test proves the queue accepts a candidate; this one proves the path the
- * plugin actually runs: turn → correction → flagged fact → queue. Without it, a
- * wrong id, a wrong home, or a wrong gate would look fine in unit tests and silently
- * promote nothing in production.
+ * The unit tests prove the queue accepts a candidate and orders buckets; this one
+ * proves the path the plugin actually runs: turn → lesson → queue, with the bucket
+ * the turn earned, and the late correction that re-buckets a lesson already queued.
+ * Without it a wrong id, a wrong home or a wrong gate would look fine in unit tests
+ * and silently promote nothing in production.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,29 +17,29 @@ const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-promote-e2e-'));
 process.env.SOULBRIDGE_HOME = home;
 
 const { openSqlite, Soul } = await import('soulbridge');
-const { feedClassifyFromTurn, peekClassifyBatch } = await import('../index.js');
+const { feedClassifyFromTurn, peekClassifyBatch, backfillClassifyFromCorrection, commitClassifyBatch, backfillClassifyBacklog } =
+  await import('../index.js');
 
-test('T1: a corrected turn promotes its flagged lesson into the classify queue', () => {
-  // Same identity the plugin resolves from config, or it would open a different db.
-  const scope = { soulId: 'xiaoling', userId: 'local' };
+const scope = { soulId: 'xiaoling', userId: 'local' };
+
+function seed({ turnId, turnNo, userText, assistantText, lesson, at }) {
   const store = openSqlite(join(home, 'soul.db'));
   const soul = new Soul({ store, ...scope });
-  const at = Date.parse('2026-11-02T13:00:00Z');
-
   store.putTurn({
     ...scope,
-    id: 't1',
+    id: turnId,
     sessionId: 'sess',
-    turnNo: 1,
+    turnNo,
     startedAt: at,
-    userText: '不对，以后改动前先说影响再动手',
+    userText,
+    assistantText,
     steps: [],
   });
   store.putFact({
     ...scope,
-    id: 'f_lesson',
-    statement: '改动前先说明影响面再动手',
-    sourceTurnId: 't1',
+    id: `f_${turnId}`,
+    statement: lesson,
+    sourceTurnId: turnId,
     at,
     typeName: '要求',
     holder: 'world',
@@ -46,31 +47,126 @@ test('T1: a corrected turn promotes its flagged lesson into the classify queue',
     role: 'lesson',
     status: 'candidate',
   });
-  store.putFact({
-    ...scope,
-    id: 'f_plain',
-    statement: '用户今天把配置文件的读取顺序调整了一下',
-    sourceTurnId: 't1',
-    at,
-    typeName: '修改',
-    holder: 'world',
+  return { store, soul };
+}
+
+test('promote: an ordinary turn is queued too, and a corrected one is bucketed first', () => {
+  const first = seed({
+    turnId: 't1',
+    turnNo: 1,
+    userText: '今天继续做第二刀',
+    assistantText: '好',
+    lesson: '改动前先说明影响面再动手',
+    at: Date.parse('2026-11-07T10:00:00Z'),
   });
-
-  // Before the correction the turn is ordinary: nothing is promoted.
-  assert.equal(feedClassifyFromTurn('t1'), 0);
-  assert.equal(peekClassifyBatch().length, 0);
-
-  soul.recordCorrection({ userText: '不对，以后改动前先说影响再动手', assistantText: '好' });
-
-  const added = feedClassifyFromTurn('t1');
-  assert.equal(added, 1, 'exactly one candidate, not every fact of the turn');
-  const batch = peekClassifyBatch();
-  assert.deepEqual(batch.map((item) => item.id), ['f_lesson']);
-  assert.equal(batch[0].reason, 'T1-修正');
+  // No correction: the turn is ordinary. It used to be invisible to the queue.
+  assert.equal(feedClassifyFromTurn('t1'), 1);
+  assert.deepEqual(peekClassifyBatch().map((item) => [item.id, item.reason]), [
+    ['f_t1', '全收'],
+  ]);
   // Re-running must not duplicate: the drain can retry the same turn.
   assert.equal(feedClassifyFromTurn('t1'), 0);
-  assert.equal(peekClassifyBatch().length, 1);
+  first.store.close();
+
+  const second = seed({
+    turnId: 't2',
+    turnNo: 2,
+    userText: '不对，先说影响再动手',
+    assistantText: '明白',
+    lesson: '说服之前先量化代价',
+    at: Date.parse('2026-11-07T10:05:00Z'),
+  });
+  second.soul.recordCorrection({ userText: '不对，先说影响再动手', assistantText: '明白' });
+  assert.equal(feedClassifyFromTurn('t2'), 1);
+  const batch = peekClassifyBatch();
+  // The corrected lesson is first even though it arrived second: the bucket decides.
+  assert.deepEqual(batch.map((item) => [item.id, item.reason]), [
+    ['f_t2', 'T1-修正'],
+    ['f_t1', '全收'],
+  ]);
+  second.store.close();
+});
+
+test('promote: a correction that arrives late re-buckets the lesson it points at', () => {
+  const { store, soul } = seed({
+    turnId: 't3',
+    turnNo: 3,
+    userText: 'SQLite 的 date() 把数字当儒略日',
+    assistantText: '记下了',
+    lesson: '别用 date(<epoch秒>) 转日期',
+    at: Date.parse('2026-11-07T10:10:00Z'),
+  });
+  // Queued as 全收 first: at that moment nobody had corrected anything.
+  assert.equal(feedClassifyFromTurn('t3'), 1);
+  assert.equal(peekClassifyBatch().find((item) => item.id === 'f_t3').reason, '全收');
+
+  // The correction lands afterwards — the blind spot this backfill exists for.
+  soul.recordCorrection({ userText: 'SQLite 的 date() 把数字当儒略日', assistantText: '记下了' });
+  const result = backfillClassifyFromCorrection({
+    userText: 'SQLite 的 date() 把数字当儒略日',
+    assistantText: '记下了',
+  });
+  assert.equal(result.turns, 1);
+  assert.equal(result.reBucketed, 1);
+  // One row, not two: the reason changed, the item did not.
+  assert.equal(peekClassifyBatch().filter((item) => item.id === 'f_t3').length, 1);
+  assert.equal(peekClassifyBatch().find((item) => item.id === 'f_t3').reason, 'T1-修正');
+
+  // A parked lesson (待修 → candidate again) gets a second pass from the correction:
+  // the classifier consumed the queue item, the row stayed a candidate.
+  commitClassifyBatch(['f_t3']);
+  store.setFactStatus('f_t3', 'candidate');
+  const again = backfillClassifyFromCorrection({
+    userText: 'SQLite 的 date() 把数字当儒略日',
+    assistantText: '记下了',
+  });
+  assert.equal(again.queued, 1);
   store.close();
+});
+
+test('promote: a correction with no matching turn is a no-op, not a guess', () => {
+  const result = backfillClassifyFromCorrection({ userText: '从来没有说过这句话', assistantText: '也没有这句' });
+  assert.deepEqual(result, { turns: 0, queued: 0, reBucketed: 0 });
+});
+
+test('promote: the backlog pass queues parked lessons once, then a marker stops it', () => {
+  // Two lessons nobody ever corrected: this is the 存量 shape (0018 §九 3 A).
+  for (const [turnId, turnNo, lesson] of [
+    ['t10', 10, '先验证再动手'],
+    ['t11', 11, '改动完看一遍 diff'],
+  ]) {
+    const { store } = seed({
+      turnId,
+      turnNo,
+      userText: `第 ${turnNo} 轮`,
+      assistantText: '好',
+      lesson,
+      at: Date.parse('2026-11-07T11:00:00Z'),
+    });
+    store.close();
+  }
+  assert.equal(backfillClassifyBacklog(), 2);
+  assert.deepEqual(
+    peekClassifyBatch()
+      .filter((item) => item.reason === '存量')
+      .map((item) => item.id)
+      .sort(),
+    ['f_t10', 'f_t11'],
+  );
+  // A second pass is not billed again — the marker is the contract. A lesson that
+  // arrives after the pass would be picked up by the next call without the marker,
+  // so this is what gives the assertion teeth (a queue-dedupe would pass either way).
+  const late = seed({
+    turnId: 't12',
+    turnNo: 12,
+    userText: '第 12 轮',
+    assistantText: '好',
+    lesson: '发布前先看 diff',
+    at: Date.parse('2026-11-07T11:05:00Z'),
+  });
+  late.store.close();
+  assert.equal(backfillClassifyBacklog(), 0);
+  assert.equal(peekClassifyBatch().some((item) => item.id === 'f_t12'), false, 'marker must stop the pass');
 });
 
 test.after(() => {
