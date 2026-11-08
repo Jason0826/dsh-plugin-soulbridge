@@ -2596,7 +2596,29 @@ const CLASSIFY_BATCH = 10;
  * queue had a producer. A weak reason must not starve a strong one: the cap is ten
  * per step, so order is the difference between "classified next step" and "in a day".
  */
-const CLASSIFY_BUCKETS = ['T1-修正', '全收', '存量', '索引'];
+const CLASSIFY_BUCKETS = ['T1-修正', '全收', '存量', '索引', '索引重写'];
+
+/**
+ * Does an index line point at a place instead of carrying the information? (0029 §五)
+ *
+ * A reviewed sample of 189 lines found a quarter of them useless for the job they
+ * exist for: "重启杀掉 turn 18" tells a future reader nothing, because that reader
+ * has no turn 18. The check is deliberately narrow — local coordinates and changelog
+ * shapes, both of which are structural. Semantic drift ("口号") is the model's
+ * judgement and stays with the human sample; pretending a regex covers it would turn
+ * "not checked" into "checked".
+ */
+export function isLocalCoordinate(line) {
+  const text = String(line ?? '').trim();
+  if (text.length === 0) return false;
+  if (/\bturn\s*(?:id|编号|\d)|\bstep\s*\d+|\b(fc|tp)_[a-z0-9_]+|\bunit=|schema\s*v?\d+/i.test(text)) return true;
+  // A bare hex run that contains a digit: a commit hash, not a word.
+  if (/\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/i.test(text)) return true;
+  // "新增了 X 字段" records the edit; the rule's content is what the line needs.
+  if (/^(新增了?|加了|改了|改为|提了|补了|删了|换了|移除)/.test(text)) return true;
+  if (/(?:增|加|改|提|补|删|换|移)了[^，。；]{0,10}(字段|槽|列)/.test(text)) return true;
+  return false;
+}
 
 function classifyBucketRank(reason) {
   const at = CLASSIFY_BUCKETS.indexOf(String(reason ?? ''));
@@ -2784,14 +2806,20 @@ export function backfillClassifyFromCorrection(correction) {
  */
 export function applyClassifications(classified, batch, soul) {
   const known = new Map(batch.map((item) => [item.id, item]));
-  const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0 };
+  const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0, indexRejected: 0 };
   for (const item of classified) {
     const entry = known.get(item.id);
     if (!entry) continue;
     if (item.kind === 'index') {
       // A rule that is no longer an active rule (retired, re-roled) is skipped, not
       // demoted: writing the line elsewhere would put a parked item in the directory.
-      if (item.index && soul.markRuleIndex(item.id, item.index)) counts.indexed += 1;
+      // A line that points at a local coordinate is refused for the same reason a
+      // rewrite exists at all: the old line is at least readable, and silently
+      // replacing it with a pointer would make the catalog worse than before.
+      if (item.index && isLocalCoordinate(item.index)) {
+        counts.indexRejected += 1;
+        log(`classify: index rejected ${item.id} (points at a place: ${item.index.slice(0, 40)})`);
+      } else if (item.index && soul.markRuleIndex(item.id, item.index)) counts.indexed += 1;
       else {
         counts.indexSkipped += 1;
         log(`classify: index skipped ${item.id} (${item.index ? 'not an active rule' : 'empty line'})`);
@@ -2856,7 +2884,11 @@ async function runClassifyStep() {
     return true;
   }
 
-  const { rules, profiles, pending, indexed, indexSkipped } = applyClassifications(classified, batch, ensureSoul());
+  const { rules, profiles, pending, indexed, indexSkipped, indexRejected } = applyClassifications(
+    classified,
+    batch,
+    ensureSoul(),
+  );
   commitClassifyBatch(batch.map((item) => item.id));
   // "Promoted because of what" is a number, not a memory: the brief's acceptance
   // metric is the reason split, and it can only be counted if it is logged.
@@ -2868,9 +2900,19 @@ async function runClassifyStep() {
   const reasonText = Object.entries(reasons).map(([reason, n]) => `${reason}:${n}`).join(',');
   log(
     `classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}` +
-      ` indexed=${indexed} index-skipped=${indexSkipped} reasons=${reasonText}`,
+      ` indexed=${indexed} index-skipped=${indexSkipped} index-rejected=${indexRejected} reasons=${reasonText}`,
   );
-  trace({ event: 'classify', batch: batch.length, rules, profiles, pending, indexed, indexSkipped, reasons });
+  trace({
+    event: 'classify',
+    batch: batch.length,
+    rules,
+    profiles,
+    pending,
+    indexed,
+    indexSkipped,
+    indexRejected,
+    reasons,
+  });
   return true;
 }
 
@@ -2970,6 +3012,46 @@ export function backfillCatalogIndexes() {
     writeFileSync(marker, JSON.stringify({ ids: [...attempted].sort() }));
   } catch (error) {
     log(`catalog backfill failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return queued;
+}
+
+/**
+ * One-shot rewrite of every catalog line under the self-containment rule (0029 §五).
+ *
+ * A user review of 20 sampled lines flagged 5: three pointed at a location
+ * ("turn 18", "unit=Nturns"), one recorded an edit ("新增了…字段"), one was a slogan
+ * with no information. The sample rate (25%) and what a regex can catch (4%) were far
+ * apart, so the fix is a prompt rewrite plus a full pass — a filter would have moved
+ * the defect out of sight instead of out of the data.
+ *
+ * Same queue, same writer, same prompt as the backfill: this is the index job run over
+ * rows that already have a line, not a second pipeline (rule 39, one writer). The
+ * marker is a bare flag on purpose, unlike the backfill's id bookkeeping: this is a
+ * migration of an old shape, and the new prompt covers every rule written from now on,
+ * so re-running it would only rewrite good lines. A rule that fails three times keeps
+ * its old line — visible as `index-skipped` in that batch, never as a silent `待修`.
+ */
+export function backfillCatalogIndexRewrites() {
+  const marker = join(HOME, '.catalog-index-rewrite.json');
+  const config = readConfig();
+  if (config.extract === 'off' || !usesModel(config)) return 0;
+  if (existsSync(marker)) return 0;
+  let queued = 0;
+  try {
+    const soul = ensureSoul();
+    for (const rule of soul.rules()) {
+      if (
+        enqueueClassifyCandidate({ id: rule.id, statement: rule.statement, reason: '索引重写', kind: 'index' })
+      ) {
+        queued += 1;
+      }
+    }
+    writeFileSync(marker, JSON.stringify({ at: new Date().toISOString(), queued }));
+    if (queued > 0) log(`catalog rewrite: ${queued} rule(s) queued to rewrite their index (索引重写)`);
+    trace({ event: 'catalog-rewrite', queued });
+  } catch (error) {
+    log(`catalog rewrite failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   return queued;
 }
@@ -3691,6 +3773,9 @@ export function apply(ctx) {
         backfillClassifyBacklog();
         // 0029 stage 1: rules written before the catalog existed owe an index line,
         // and without it the directory is empty and the experiment cannot be judged.
+        // §五 first: lines that point at a place rather than carry the information are
+        // rewritten once (one-shot marker), then the backfill covers rules with none.
+        backfillCatalogIndexRewrites();
         backfillCatalogIndexes();
       }
 

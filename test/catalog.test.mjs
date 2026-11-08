@@ -86,13 +86,13 @@ test('queue: an index item travels with its kind and drains after real classific
 test('wiring: the backfill runs from the first real message, through the same queue', () => {
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const userBranch = source.slice(source.indexOf("if (kind === 'user') {"));
-  assert.match(userBranch.slice(0, 600), /backfillCatalogIndexes\(\)/);
+  assert.match(userBranch.slice(0, 1400), /backfillCatalogIndexes\(\)/);
 
   const step = source.slice(source.indexOf('async function runClassifyStep'));
-  const body = step.slice(0, 3200);
+  const body = step.slice(0, 3600);
   // One prompt, one model call per step, two jobs: the routing function is where they
   // separate, and a step that forgets to call it would drain the queue for nothing.
-  assert.match(body, /applyClassifications\(classified, batch, ensureSoul\(\)\)/);
+  assert.match(body, /applyClassifications\(\s*classified,\s*batch,\s*ensureSoul\(\),?\s*\)/);
 });
 
 test('index answers apply as indexes; an empty or stale answer is skipped, never parked', () => {
@@ -143,7 +143,74 @@ test('index answers apply as indexes; an empty or stale answer is skipped, never
     ['rule', 'fc_new', { trigger: '{"any":["json"]}', action: '用 edit 工具', index: '改 JSON' }],
   ]);
   // Skipped is not pending: 待修 would demote a rule that is already in use.
-  assert.deepEqual(counts, { rules: 1, profiles: 0, pending: 0, indexed: 1, indexSkipped: 3 });
+  assert.deepEqual(counts, { rules: 1, profiles: 0, pending: 0, indexed: 1, indexSkipped: 3, indexRejected: 0 });
+});
+
+test('index lines that point at a place are refused, and the old line survives', async () => {
+  // The user reviewed 20 sampled lines and flagged 5: three pointed at a location
+  // ("turn 18", "unit=Nturns"), one recorded an edit, one was a slogan. A rewrite that
+  // wrote such a line back would make the catalog worse than before, so the write is
+  // refused and counted — the old line, whatever its quality, is at least readable.
+  const { isLocalCoordinate } = await import('../index.js');
+  for (const bad of [
+    '重启杀掉 turn 18，与 11-06 turn 11 同缺口',
+    '348k 停 6.5 小时，turn 20 全量重读约 ¥0.35',
+    '抽取生效以 unit=Nturns 日志为准',
+    '抽取模板加了「有效到」字段',
+    '依据槽位由代码自动写本轮 turn id',
+    'fix in 8b2c60c by hand',
+  ]) {
+    assert.equal(isLocalCoordinate(bad), true, `应拒绝：${bad}`);
+  }
+  for (const good of [
+    '重启会杀掉正在执行的轮，那一轮不会被记录',
+    '上下文放 6.5 小时不压缩，下次开口要全价重读',
+    '改 JSON 别用字符串替换',
+    '不看到整条线索跑通的日志，不说抽取已生效',
+  ]) {
+    assert.equal(isLocalCoordinate(good), false, `不该拒绝：${good}`);
+  }
+
+  const calls = [];
+  const soul = {
+    markRuleIndex(id, index) {
+      calls.push([id, index]);
+      return true;
+    },
+  };
+  const batch = [{ id: 'fc_ptr', statement: '重启杀掉 turn 18', reason: '索引重写', kind: 'index' }];
+  const counts = applyClassifications(
+    [{ id: 'fc_ptr', kind: 'index', index: '重启杀掉 turn 18' }],
+    batch,
+    soul,
+  );
+  assert.deepEqual(calls, [], '拒绝的索引句不能被写进去');
+  assert.equal(counts.indexRejected, 1);
+  assert.equal(counts.indexed, 0);
+});
+
+test('rewrite: a one-shot pass queues every placed rule, after the missing-index ones', () => {
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const userBranch = source.slice(source.indexOf("if (kind === 'user') {"));
+  const body = userBranch.slice(0, 900);
+  // Order matters: rewriting first covers rows that already have a line; the backfill
+  // still runs after it for rows that have none.
+  assert.ok(body.indexOf('backfillCatalogIndexRewrites()') >= 0, '改写批次必须从首个真实消息触发');
+  assert.ok(
+    body.indexOf('backfillCatalogIndexRewrites()') < body.indexOf('backfillCatalogIndexes()'),
+    '改写排在补齐之前',
+  );
+  // A bare one-shot flag is right here (unlike the backfill's id bookkeeping): the new
+  // prompt covers everything written from now on, so a second pass would only rewrite
+  // lines that are already good.
+  assert.match(source, /\.catalog-index-rewrite\.json/);
+
+  enqueueClassifyCandidate({ id: 'fc_rw', statement: '重写的规则', reason: '索引重写', kind: 'index' });
+  const order = peekClassifyBatch().map((item) => item.id);
+  assert.ok(
+    order.indexOf('fc_rw') > order.indexOf('fc_rule'),
+    '索引重写排在补索引之后：先把缺的补上，再统一改写法',
+  );
 });
 
 test('wiring: the two measured tools write a countable event', () => {

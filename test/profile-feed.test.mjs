@@ -46,9 +46,14 @@ test('feed: the classify step is the thing that feeds it', async () => {
   // to run: without this call the merge stage has no producer again. The call moved
   // into the routing function (0029), so the assertion follows the chain instead of
   // the old location.
-  assert.match(classify.slice(0, 3200), /applyClassifications\(classified, batch, ensureSoul\(\)\)/);
+  assert.match(
+    classify.slice(0, 3200),
+    /applyClassifications\(\s*classified,\s*batch,\s*ensureSoul\(\),?\s*\)/,
+  );
   const routing = source.slice(source.indexOf('export function applyClassifications'));
-  assert.match(routing.slice(0, 2000), /enqueueProfileCandidate\(/);
+  // Position-free: the routing function is where classification and the merge queue meet,
+  // and how many lines of comment sit above that call is not the test's business.
+  assert.match(routing, /enqueueProfileCandidate\(/);
 });
 
 test.after(() => {
