@@ -2669,6 +2669,35 @@ export function retryClassifyBatch(batch) {
 }
 
 /**
+ * Put a shape miss back once.
+ *
+ * `commitClassifyBatch` drops the whole batch, so an item whose answer did not fit the
+ * contract — the prefix was ignored, the line came back empty, the line pointed at a
+ * place — used to leave the queue with its old line intact and nothing recording that a
+ * line was still owed. One more ask fixes a misread batch; a second miss is a decision
+ * to make by hand, not a loop.
+ */
+export function requeueShapeMisses(batch, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+  const byId = new Map(batch.map((item) => [item.id, item]));
+  const again = [];
+  for (const id of ids) {
+    const item = byId.get(id);
+    if (!item) continue;
+    const misses = (item.misses ?? 0) + 1;
+    if (misses > 1) {
+      log(`classify: shape miss again — dropped ${id}`);
+      trace({ event: 'classify-shape-dropped', id, misses });
+      continue;
+    }
+    again.push({ ...item, misses });
+  }
+  if (again.length === 0) return 0;
+  writeClassifyQueue([...again, ...readClassifyQueue()]);
+  return again.length;
+}
+
+/**
  * Put one lesson in the classification queue.
  *
  * The reason travels with it so the queue is explainable: "why was this promoted"
@@ -2806,7 +2835,7 @@ export function backfillClassifyFromCorrection(correction) {
  */
 export function applyClassifications(classified, batch, soul) {
   const known = new Map(batch.map((item) => [item.id, item]));
-  const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0, indexRejected: 0 };
+  const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0, indexRejected: 0, retry: [] };
   for (const item of classified) {
     const entry = known.get(item.id);
     if (!entry) continue;
@@ -2818,19 +2847,30 @@ export function applyClassifications(classified, batch, soul) {
       // replacing it with a pointer would make the catalog worse than before.
       if (item.index && isLocalCoordinate(item.index)) {
         counts.indexRejected += 1;
+        counts.retry.push(item.id);
         log(`classify: index rejected ${item.id} (points at a place: ${item.index.slice(0, 40)})`);
       } else if (item.index && soul.markRuleIndex(item.id, item.index)) counts.indexed += 1;
       else {
         counts.indexSkipped += 1;
-        log(`classify: index skipped ${item.id} (${item.index ? 'not an active rule' : 'empty line'})`);
+        if (item.index) {
+          // The store refused it: the rule is not an active rule any more. Asking again
+          // would only ask about a retired rule, so this one is not retried.
+          log(`classify: index skipped ${item.id} (not an active rule)`);
+        } else {
+          counts.retry.push(item.id);
+          log(`classify: index skipped ${item.id} (empty line)`);
+        }
       }
     } else if (entry.kind === 'index') {
       // The batch said this row is already placed and only owes a catalog line. An
       // answer that classifies it again would rewrite a trigger nobody asked about
       // (addSlots would stack a second 触发 slot) — ignore it and count the miss, so a
       // model that ignores the prefix shows up as `index-skipped=10` on the first batch
-      // instead of quietly corrupting the rule layer.
+      // instead of quietly corrupting the rule layer. The line itself is still owed, so
+      // it goes back once: on 11-08 one batch of ten was answered this way and those ten
+      // rules kept their old line for good.
       counts.indexSkipped += 1;
+      counts.retry.push(item.id);
       log(`classify: index item answered as ${item.kind} — ignored (${item.id})`);
     } else if (item.kind === 'rule' && item.trigger) {
       soul.markRule(item.id, { trigger: item.trigger, action: item.action, index: item.index });
@@ -2884,12 +2924,13 @@ async function runClassifyStep() {
     return true;
   }
 
-  const { rules, profiles, pending, indexed, indexSkipped, indexRejected } = applyClassifications(
+  const { rules, profiles, pending, indexed, indexSkipped, indexRejected, retry } = applyClassifications(
     classified,
     batch,
     ensureSoul(),
   );
   commitClassifyBatch(batch.map((item) => item.id));
+  const shapeRetry = requeueShapeMisses(batch, retry);
   // "Promoted because of what" is a number, not a memory: the brief's acceptance
   // metric is the reason split, and it can only be counted if it is logged.
   const reasons = {};
@@ -2900,7 +2941,7 @@ async function runClassifyStep() {
   const reasonText = Object.entries(reasons).map(([reason, n]) => `${reason}:${n}`).join(',');
   log(
     `classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}` +
-      ` indexed=${indexed} index-skipped=${indexSkipped} index-rejected=${indexRejected} reasons=${reasonText}`,
+      ` indexed=${indexed} index-skipped=${indexSkipped} index-rejected=${indexRejected} shape-retry=${shapeRetry} reasons=${reasonText}`,
   );
   trace({
     event: 'classify',
@@ -2911,6 +2952,7 @@ async function runClassifyStep() {
     indexed,
     indexSkipped,
     indexRejected,
+    shapeRetry,
     reasons,
   });
   return true;

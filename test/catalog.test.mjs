@@ -15,8 +15,24 @@ import { join } from 'node:path';
 const home = mkdtempSync(join(tmpdir(), 'dsh-soulbridge-catalog-'));
 process.env.SOULBRIDGE_HOME = home;
 
-const { renderCatalog, catalogBackfillIds, enqueueClassifyCandidate, peekClassifyBatch, applyClassifications } =
-  await import('../index.js');
+const {
+  renderCatalog,
+  catalogBackfillIds,
+  enqueueClassifyCandidate,
+  peekClassifyBatch,
+  applyClassifications,
+  requeueShapeMisses,
+  commitClassifyBatch,
+} = await import('../index.js');
+
+/** Leave no queue behind for the next test: the file is shared by the whole run. */
+function drainQueue() {
+  for (;;) {
+    const ids = peekClassifyBatch().map((item) => item.id);
+    if (ids.length === 0) return;
+    commitClassifyBatch(ids);
+  }
+}
 
 test('catalog: empty entries produce no block at all', () => {
   assert.equal(renderCatalog([], 188, 188), '');
@@ -143,7 +159,43 @@ test('index answers apply as indexes; an empty or stale answer is skipped, never
     ['rule', 'fc_new', { trigger: '{"any":["json"]}', action: '用 edit 工具', index: '改 JSON' }],
   ]);
   // Skipped is not pending: 待修 would demote a rule that is already in use.
-  assert.deepEqual(counts, { rules: 1, profiles: 0, pending: 0, indexed: 1, indexSkipped: 3, indexRejected: 0 });
+  assert.deepEqual(counts, {
+    rules: 1,
+    profiles: 0,
+    pending: 0,
+    indexed: 1,
+    indexSkipped: 3,
+    indexRejected: 0,
+    // A line is still owed for these two: one ignored the prefix, one came back empty.
+    // Not for fc_stale — the rule is retired, so asking again would only ask about a
+    // rule that is not in the catalog any more.
+    retry: ['fc_empty', 'fc_prefix'],
+  });
+});
+
+test('a shape miss goes back once, then it is dropped', () => {
+  // 11-08: one batch of ten index rows was answered as 规则| and the prefix guard kept
+  // every old line — then the batch was committed and those ten rules were never asked
+  // again, because a rewritten line is not "missing". One more ask closes that hole; a
+  // second miss is left for a human, not looped.
+  drainQueue();
+  const item = { id: 'fc_miss', statement: '重启会杀掉进行中的轮', reason: '索引重写', kind: 'index' };
+  assert.equal(requeueShapeMisses([item], []), 0);
+  assert.equal(requeueShapeMisses([item], ['fc_ghost']), 0, '批次外的 id 不能被放回');
+  assert.equal(requeueShapeMisses([item], ['fc_miss']), 1);
+  const back = peekClassifyBatch();
+  assert.deepEqual(back, [{ ...item, misses: 1 }], '放回时要带着计数和 kind');
+  // The next batch takes it and carries the count — that count is what bounds the retry.
+  commitClassifyBatch(['fc_miss']);
+  assert.equal(requeueShapeMisses(back, ['fc_miss']), 0, '第二次失败不再循环');
+  assert.deepEqual(peekClassifyBatch(), []);
+});
+
+test('wiring: a shape miss is put back from the same place the batch is committed', () => {
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  // The retry has to survive a reload, so it lives in the queue file, not in a variable.
+  assert.match(source, /writeClassifyQueue\(\[\.\.\.again, \.\.\.readClassifyQueue\(\)\]\)/);
+  assert.match(source, /const shapeRetry = requeueShapeMisses\(batch, retry\)/);
 });
 
 test('index lines that point at a place are refused, and the old line survives', async () => {
@@ -187,6 +239,9 @@ test('index lines that point at a place are refused, and the old line survives',
   assert.deepEqual(calls, [], '拒绝的索引句不能被写进去');
   assert.equal(counts.indexRejected, 1);
   assert.equal(counts.indexed, 0);
+  // Refused once, asked again: the same rule with a better sentence is what the pass is
+  // for, and the old line stays untouched until a good one arrives.
+  assert.deepEqual(counts.retry, ['fc_ptr']);
 });
 
 test('rewrite: a one-shot pass queues every placed rule, after the missing-index ones', () => {
