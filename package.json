@@ -42,6 +42,6 @@
     "setup": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
-    "soulbridge": ">=0.0.120 <0.1.0"
+    "soulbridge": ">=0.0.121 <0.1.0"
   }
 }
