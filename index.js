@@ -12,6 +12,7 @@
  * ~/.soulbridge/plugin-state.json.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2778,27 +2779,38 @@ async function runClassifyStep() {
 }
 
 /**
- * The lessons extracted before the queue had a producer (0018 §九 3 A, 存量).
+ * The candidates extracted before the queue had a producer (0018 §九 3 A, 存量).
  *
- * One pass, through the queue's own writer (one writer, one cap: a script writing
- * the file directly would bypass both), with a marker so a restart does not re-bill
- * it. Capped by the queue's own cap rather than a second limit here — a drop is
- * logged by the writer, so "how many were left behind" stays answerable.
+ * One pass per inventory, through the queue's own writer (one writer, one cap: a
+ * script writing the file directly would bypass both). The marker records *which*
+ * inventory was drained, not merely that one was (0018 §九 3 B): schema v17 demotes
+ * rules that can never fire into candidates, and no drained turn will ever feed them,
+ * so a bare "done" flag left that debt unqueued forever while the queue looked empty —
+ * the candidates were invisible for the second time, now with a clean queue as alibi.
+ * The cost stays one-shot: the same inventory answers 0.
+ *
+ * Capped by the queue's own cap rather than a second limit here — a drop is logged by
+ * the writer, so "how many were left behind" stays answerable.
  */
 export function backfillClassifyBacklog() {
   const marker = join(HOME, '.classify-backfill-done');
-  if (existsSync(marker)) return 0;
   const config = readConfig();
   if (config.extract === 'off' || !usesModel(config)) return 0;
   let queued = 0;
   try {
     const soul = ensureSoul();
-    for (const fact of soul.promotionBacklog()) {
+    const backlog = soul.promotionBacklog();
+    const digest = createHash('sha256')
+      .update(backlog.map((fact) => fact.id).join(','))
+      .digest('hex')
+      .slice(0, 16);
+    if (existsSync(marker) && readFileSync(marker, 'utf8').trim() === digest) return 0;
+    for (const fact of backlog) {
       if (enqueueClassifyCandidate({ id: fact.id, statement: fact.statement, reason: '存量' })) queued += 1;
     }
-    log(`classify backfill: ${queued} backlog lesson(s) queued (存量)`);
+    log(`classify backfill: ${queued} backlog candidate(s) queued (存量)`);
     trace({ event: 'classify-backlog', queued });
-    writeFileSync(marker, new Date().toISOString());
+    writeFileSync(marker, digest);
   } catch (error) {
     log(`classify backfill failed: ${error instanceof Error ? error.message : String(error)}`);
   }

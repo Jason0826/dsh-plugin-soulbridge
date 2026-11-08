@@ -129,7 +129,7 @@ test('promote: a correction with no matching turn is a no-op, not a guess', () =
   assert.deepEqual(result, { turns: 0, queued: 0, reBucketed: 0 });
 });
 
-test('promote: the backlog pass queues parked lessons once, then a marker stops it', () => {
+test('promote: the backlog pass is one per inventory, so a new candidate re-opens it', () => {
   // Two lessons nobody ever corrected: this is the 存量 shape (0018 §九 3 A).
   for (const [turnId, turnNo, lesson] of [
     ['t10', 10, '先验证再动手'],
@@ -153,9 +153,12 @@ test('promote: the backlog pass queues parked lessons once, then a marker stops 
       .sort(),
     ['f_t10', 'f_t11'],
   );
-  // A second pass is not billed again — the marker is the contract. A lesson that
-  // arrives after the pass would be picked up by the next call without the marker,
-  // so this is what gives the assertion teeth (a queue-dedupe would pass either way).
+  // The same inventory answers 0: the pass is not billed twice for a restart.
+  assert.equal(backfillClassifyBacklog(), 0);
+  // A candidate that appears *after* the pass without a drained turn is exactly the
+  // shape a migration leaves behind (schema v17 demotes rules that cannot fire). The
+  // marker remembers which inventory it drained, so this one is not lost; a bare
+  // "done" flag passed the assertion above and dropped this row forever.
   const late = seed({
     turnId: 't12',
     turnNo: 12,
@@ -165,8 +168,10 @@ test('promote: the backlog pass queues parked lessons once, then a marker stops 
     at: Date.parse('2026-11-07T11:05:00Z'),
   });
   late.store.close();
+  assert.equal(backfillClassifyBacklog(), 1, 'a new candidate re-opens the pass');
+  assert.equal(peekClassifyBatch().some((item) => item.id === 'f_t12'), true);
+  // ...and once it is in, the inventory is drained again.
   assert.equal(backfillClassifyBacklog(), 0);
-  assert.equal(peekClassifyBatch().some((item) => item.id === 'f_t12'), false, 'marker must stop the pass');
 });
 
 test('promote: a rule the model roled itself waits in the queue, not in the rule layer', () => {
