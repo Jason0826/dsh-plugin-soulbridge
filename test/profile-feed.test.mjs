@@ -43,8 +43,12 @@ test('feed: the classify step is the thing that feeds it', async () => {
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const classify = source.slice(source.indexOf('async function runClassifyStep'));
   // The queue must be filled by classification, not by a script someone remembers
-  // to run: without this call the merge stage has no producer again.
-  assert.match(classify.slice(0, 3000), /enqueueProfileCandidate\(/);
+  // to run: without this call the merge stage has no producer again. The call moved
+  // into the routing function (0029), so the assertion follows the chain instead of
+  // the old location.
+  assert.match(classify.slice(0, 3200), /applyClassifications\(classified, batch, ensureSoul\(\)\)/);
+  const routing = source.slice(source.indexOf('export function applyClassifications'));
+  assert.match(routing.slice(0, 2000), /enqueueProfileCandidate\(/);
 });
 
 test.after(() => {

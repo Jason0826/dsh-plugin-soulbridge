@@ -1111,6 +1111,32 @@ export function renderRulesBlock(rules) {
   return `<rules fired="${ids}">\n${lines}\n</rules>`;
 }
 
+/** The catalog cap (0029 §二): twenty neutral lines, not a wall of rules. */
+const CATALOG_LIMIT = 20;
+
+/**
+ * The always-on catalog: one neutral line per rule, plus the id needed to expand it.
+ *
+ * L0 of 0029 — "我记得有这些" — not a requirement block. The wording is deliberately
+ * flat: an imperative here would be a second rule layer, and rules already have a
+ * block of their own. The tail gives the count that is not shown and the way to reach
+ * it, because a directory that looks complete is worse than an honest count — and it
+ * is also the only reason the model has to call soul_recall / soul_detail at all.
+ */
+export function renderCatalog(entries, total, missingIndex = 0) {
+  if (!Array.isArray(entries) || entries.length === 0) return '';
+  const shown = entries.length;
+  const all = Math.max(shown, Number(total ?? shown));
+  const missing = Math.max(0, Math.min(Number(missingIndex ?? 0), all - shown));
+  const unshown = all - shown - missing;
+  const lines = entries.map((rule) => `- [${rule.id}] ${escapeBlockText(String(rule.index ?? ''))}`);
+  const notes = [];
+  if (unshown > 0) notes.push(`其余 ${unshown} 条未列出`);
+  if (missing > 0) notes.push(`${missing} 条还没有索引句，不在目录里`);
+  notes.push('要原话用 soul_detail(id)，按关键词找用 soul_recall。');
+  return `<catalog shown="${shown}" total="${all}">\n${lines.join('\n')}\n${notes.join('；')}\n</catalog>`;
+}
+
 /** How many facts one window may put in the prompt before it is cut. */
 const TIME_WINDOW_LIMIT = 10;
 
@@ -1173,6 +1199,31 @@ export function buildRelatedContext(text, state = {}) {
     }
   } catch (error) {
     log(`profile block failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  // 0029 stage 1: the catalog is the second always-on block. It is an index, not a
+  // decision — it does not say which rule applies, only that these memories exist,
+  // and the model decides whether to fetch one (L1). The keyword push below stays as
+  // the control arm: the experiment is calls, not a bet that pushing was wrong.
+  try {
+    const catalog = ensureSoul().catalog(CATALOG_LIMIT);
+    const block = renderCatalog(catalog.entries, catalog.total, catalog.missingIndex);
+    if (block) {
+      parts.push(block);
+      log(`catalog: entries=${catalog.entries.length} total=${catalog.total} missing=${catalog.missingIndex} chars=${block.length}`);
+      trace({
+        event: 'catalog',
+        entries: catalog.entries.length,
+        total: catalog.total,
+        missing: catalog.missingIndex,
+        chars: block.length,
+        // The ids are what makes a later soul_detail answer attributable: was the line
+        // the model expanded already in the directory it saw, or did it find it another
+        // way? Without them `catalog-stats` can only count calls, not read them.
+        ids: catalog.entries.map((rule) => rule.id),
+      });
+    }
+  } catch (error) {
+    log(`catalog block failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   // The plan is computed first because it decides which blocks are allowed.
   let plan = null;
@@ -1261,6 +1312,14 @@ export function buildRelatedContext(text, state = {}) {
       parts.push(renderRulesBlock(fired));
       log(`rules fired: ${fired.map((rule) => rule.id).join(',')}`);
       trace({ event: 'rule_fired', rules: fired.map((rule) => rule.id), turn: state.turn ?? null });
+      // Reproduction is the catalog's rank (0029): a rule that fires is a situation
+      // that came back, the same practice signal a revisited fact gets. It also keeps
+      // `catalog-stats` comparable with the old recall counting.
+      try {
+        ensureSoul().recordRecalls(fired.map((rule) => rule.id));
+      } catch (error) {
+        log(`rule recall bookkeeping failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   } catch (error) {
     log(`rules failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2537,7 +2596,7 @@ const CLASSIFY_BATCH = 10;
  * queue had a producer. A weak reason must not starve a strong one: the cap is ten
  * per step, so order is the difference between "classified next step" and "in a day".
  */
-const CLASSIFY_BUCKETS = ['T1-修正', '全收', '存量'];
+const CLASSIFY_BUCKETS = ['T1-修正', '全收', '存量', '索引'];
 
 function classifyBucketRank(reason) {
   const at = CLASSIFY_BUCKETS.indexOf(String(reason ?? ''));
@@ -2599,7 +2658,14 @@ export function enqueueClassifyCandidate(item) {
   if (queue.some((entry) => entry.id === item.id)) return false;
   writeClassifyQueue([
     ...queue,
-    { id: item.id, statement: item.statement ?? '', reason: item.reason ?? 'unknown' },
+    {
+      id: item.id,
+      statement: item.statement ?? '',
+      reason: item.reason ?? 'unknown',
+      // `kind: 'index'` is a rule that only owes its catalog line (0029). It travels
+      // in the queue so one batch can carry both jobs and the prompt can label them.
+      ...(item.kind === 'index' ? { kind: 'index' } : {}),
+    },
   ]);
   return true;
 }
@@ -2709,6 +2775,52 @@ export function backfillClassifyFromCorrection(correction) {
 }
 
 /**
+ * Apply one batch's answers. Routing only, over the soul API, so the index path can be
+ * tested without a model call.
+ *
+ * An index answer must never be re-classified, and an empty one must be *skipped*, not
+ * parked as 待修 — 待修 would demote a rule that is already in use. That is the whole
+ * reason this routing is a separate function instead of living inside the async step.
+ */
+export function applyClassifications(classified, batch, soul) {
+  const known = new Set(batch.map((item) => item.id));
+  const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0 };
+  for (const item of classified) {
+    if (!known.has(item.id)) continue;
+    if (item.kind === 'index') {
+      // A rule that is no longer an active rule (retired, re-roled) is skipped, not
+      // demoted: writing the line elsewhere would put a parked item in the directory.
+      if (item.index && soul.markRuleIndex(item.id, item.index)) counts.indexed += 1;
+      else {
+        counts.indexSkipped += 1;
+        log(`classify: index skipped ${item.id} (${item.index ? 'not an active rule' : 'empty line'})`);
+      }
+    } else if (item.kind === 'rule' && item.trigger) {
+      soul.markRule(item.id, { trigger: item.trigger, action: item.action, index: item.index });
+      counts.rules += 1;
+    } else if (item.kind === 'profile') {
+      soul.markProfile(item.id, { dimension: item.dimension });
+      // The classification is the only moment the dimension is known, so the merge
+      // queue is fed here. Without this the merge stage had no live input at all and
+      // only ever ran from a hand-seeded queue.
+      const source = batch.find((entry) => entry.id === item.id);
+      enqueueProfileCandidate({
+        id: item.id,
+        statement: source?.statement ?? '',
+        dimension: item.dimension ?? '',
+      });
+      counts.profiles += 1;
+    } else {
+      // Neither bucket is safe for an unclassifiable lesson: a rule would fire
+      // every turn, a profile line would put an imperative into a person.
+      soul.markUnclassified(item.id);
+      counts.pending += 1;
+    }
+  }
+  return counts;
+}
+
+/**
  * One classification batch per quiet step.
  *
  * Returns true when a model call was made, mirroring the extraction contract so the
@@ -2736,34 +2848,7 @@ async function runClassifyStep() {
     return true;
   }
 
-  const soul = ensureSoul();
-  let rules = 0;
-  let profiles = 0;
-  let pending = 0;
-  const known = new Map(batch.map((item) => [item.id, item]));
-  for (const item of classified) {
-    if (!known.has(item.id)) continue;
-    if (item.kind === 'rule' && item.trigger) {
-      soul.markRule(item.id, { trigger: item.trigger, action: item.action });
-      rules += 1;
-    } else if (item.kind === 'profile') {
-      soul.markProfile(item.id, { dimension: item.dimension });
-      // The classification is the only moment the dimension is known, so the merge
-      // queue is fed here. Without this the merge stage had no live input at all and
-      // only ever ran from a hand-seeded queue.
-      enqueueProfileCandidate({
-        id: item.id,
-        statement: known.get(item.id).statement,
-        dimension: item.dimension ?? '',
-      });
-      profiles += 1;
-    } else {
-      // Neither bucket is safe for an unclassifiable lesson: a rule would fire
-      // every turn, a profile line would put an imperative into a person.
-      soul.markUnclassified(item.id);
-      pending += 1;
-    }
-  }
+  const { rules, profiles, pending, indexed, indexSkipped } = applyClassifications(classified, batch, ensureSoul());
   commitClassifyBatch(batch.map((item) => item.id));
   // "Promoted because of what" is a number, not a memory: the brief's acceptance
   // metric is the reason split, and it can only be counted if it is logged.
@@ -2773,8 +2858,11 @@ async function runClassifyStep() {
     reasons[reason] = (reasons[reason] ?? 0) + 1;
   }
   const reasonText = Object.entries(reasons).map(([reason, n]) => `${reason}:${n}`).join(',');
-  log(`classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending} reasons=${reasonText}`);
-  trace({ event: 'classify', batch: batch.length, rules, profiles, pending, reasons });
+  log(
+    `classify: batch=${batch.length} rules=${rules} profiles=${profiles} pending=${pending}` +
+      ` indexed=${indexed} index-skipped=${indexSkipped} reasons=${reasonText}`,
+  );
+  trace({ event: 'classify', batch: batch.length, rules, profiles, pending, indexed, indexSkipped, reasons });
   return true;
 }
 
@@ -2813,6 +2901,67 @@ export function backfillClassifyBacklog() {
     writeFileSync(marker, digest);
   } catch (error) {
     log(`classify backfill failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return queued;
+}
+
+/**
+ * Which rules a backfill pass may enqueue: the ones never attempted.
+ *
+ * The B0 lesson as a function (0018 §九 3 B): a digest of the current inventory
+ * re-runs whenever the set shrinks, and a bare flag never picks up debt written
+ * later. Bookkeeping by id is the only form that answers both.
+ */
+export function catalogBackfillIds(missingIds, attempted) {
+  return (Array.isArray(missingIds) ? missingIds : []).filter((id) => !attempted?.has?.(id));
+}
+
+/**
+ * One pass per inventory of rules that owe a catalog line (0029 stage 1).
+ *
+ * The index is produced by the batch job that already understands a rule — same
+ * queue, same writer, same prompt — not by a second model caller (rule 39). The
+ * marker records the ids already enqueued, not "a pass happened" and not a digest
+ * of the current inventory: B0 learned both halves of that. A digest of the
+ * inventory re-runs whenever the set shrinks; a bare flag leaves debt written
+ * later unqueued forever. Here the inventory is *supposed* to shrink, so only ids
+ * never attempted are enqueued — a new rule that arrives without an index line is
+ * picked up on the next start, and a row that failed three times is not retried on
+ * every restart (its absence stays visible in the catalog's missing count).
+ */
+export function backfillCatalogIndexes() {
+  const marker = join(HOME, '.catalog-index-backfill.json');
+  const config = readConfig();
+  if (config.extract === 'off' || !usesModel(config)) return 0;
+  let queued = 0;
+  try {
+    const soul = ensureSoul();
+    const attempted = new Set();
+    if (existsSync(marker)) {
+      try {
+        const parsed = JSON.parse(readFileSync(marker, 'utf8'));
+        for (const id of parsed?.ids ?? []) attempted.add(String(id));
+      } catch (error) {
+        // A corrupt marker must not read as "everything was attempted": the debt
+        // would disappear silently. Move it aside and treat this as a first pass.
+        log(`catalog backfill marker unreadable (${error instanceof Error ? error.message : String(error)}) — starting over`);
+        renameSync(marker, `${marker}.bad-${Date.now()}`);
+      }
+    }
+    const missing = soul.rules().filter((rule) => !rule.index);
+    const wanted = new Set(catalogBackfillIds(missing.map((rule) => rule.id), attempted));
+    for (const rule of missing) {
+      if (!wanted.has(rule.id)) continue;
+      if (enqueueClassifyCandidate({ id: rule.id, statement: rule.statement, reason: '索引', kind: 'index' })) {
+        queued += 1;
+      }
+      attempted.add(rule.id);
+    }
+    if (queued > 0) log(`catalog backfill: ${queued} rule(s) queued for index (索引)`);
+    trace({ event: 'catalog-backfill', queued, missing: missing.length, attempted: attempted.size });
+    writeFileSync(marker, JSON.stringify({ ids: [...attempted].sort() }));
+  } catch (error) {
+    log(`catalog backfill failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   return queued;
 }
@@ -3095,6 +3244,9 @@ function recallTool() {
         const limit = Math.min(20, Math.max(1, Number(args?.limit ?? 5)));
         const hits = ensureSoul().recall(query, limit);
         log(`tool soul_recall: chars=${query.length} hits=${hits.length}`);
+        // 0029's judgement line is a count of calls, so the call itself must be an
+        // event. The log line was never machine-countable without a string match.
+        trace({ event: 'tool-call', name: 'soul_recall', queryChars: query.length, hits: hits.length });
         return {
           ok: true,
           count: hits.length,
@@ -3211,9 +3363,11 @@ function detailTool() {
         const detail = ensureSoul().factDetail(id);
         if (!detail) {
           log(`tool soul_detail: miss ${id}`);
+          trace({ event: 'tool-call', name: 'soul_detail', hit: false, id });
           return { ok: false, reason: `no fact ${id}` };
         }
         log(`tool soul_detail: ${id} turn=${detail.turn ? 'yes' : 'no'}`);
+        trace({ event: 'tool-call', name: 'soul_detail', hit: true, id, hasTurn: Boolean(detail.turn) });
         return {
           ok: true,
           statement: detail.fact.statement,
@@ -3527,6 +3681,9 @@ export function apply(ctx) {
         // Same one-shot contract for the classification backlog: the lessons written
         // before the queue had a producer are owed a pass (0018 §九 3 A, 存量).
         backfillClassifyBacklog();
+        // 0029 stage 1: rules written before the catalog existed owe an index line,
+        // and without it the directory is empty and the experiment cannot be judged.
+        backfillCatalogIndexes();
       }
 
       // Only the human's own prose. runtime-context / time-context / injected
