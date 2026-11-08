@@ -169,6 +169,35 @@ test('promote: the backlog pass queues parked lessons once, then a marker stops 
   assert.equal(peekClassifyBatch().some((item) => item.id === 'f_t12'), false, 'marker must stop the pass');
 });
 
+test('promote: a rule the model roled itself waits in the queue, not in the rule layer', () => {
+  const store = openSqlite(join(home, 'soul.db'));
+  const soul = new Soul({ store, ...scope });
+  store.putTurn({
+    ...scope,
+    id: 't20',
+    sessionId: 'sess',
+    turnNo: 20,
+    startedAt: Date.parse('2026-11-07T10:20:00Z'),
+    userText: '历史事件的有效期到发生时刻为止',
+    assistantText: '好',
+    steps: [],
+  });
+  // `角色=rule` from the extractor: a rule is only a rule once a 触发 slot exists,
+  // and the classifier writes that. Written active it was counted in the layer,
+  // injected nowhere, and invisible as debt (0018 §九 3 B).
+  const fact = soul.recordFact({
+    ...scope,
+    statement: '用户认为历史事件的 valid_until 应等于事件发生时间',
+    role: 'rule',
+    sourceTurnId: 't20',
+  });
+  assert.equal(fact.status, 'candidate');
+  assert.deepEqual(soul.rules(), [], 'no trigger, no rule layer');
+  assert.equal(feedClassifyFromTurn('t20'), 1, 'the queue takes it by status, not by role');
+  assert.equal(peekClassifyBatch().find((item) => item.id === fact.id).reason, '全收');
+  store.close();
+});
+
 test.after(() => {
   try {
     rmSync(home, { recursive: true, force: true });

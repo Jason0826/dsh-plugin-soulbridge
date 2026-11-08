@@ -2620,14 +2620,15 @@ export function reBucketQueuedCandidate(id, reason) {
 }
 
 /**
- * Every lesson of a drained turn enters the classification queue (0018 §九 3, 拍板 b).
+ * Every candidate of a drained turn enters the classification queue (0018 §九 3, 拍板 b).
  *
  * The gate used to be "a corrected turn, and nothing else" (0023 T1), so a lesson
  * nobody ever corrected could never be classified — the SQLite date() trap is exactly
  * that shape. The bucket now says why the item is here; the bucket order says how
- * strong that reason is. A lesson still reaches the queue only if the model flagged
- * it (role=lesson); whether it was said with `角色=lesson` or `原则候选=是` no longer
- * matters, because both are written as candidates.
+ * strong that reason is. A row reaches the queue by being a *candidate*, whatever role
+ * the model guessed: `角色=lesson` and `原则候选=是` are two ways of saying it, and
+ * `角色=rule` is a third — a rule without a 触发 slot cannot fire, so it waits here
+ * like the others instead of sitting in the rule layer doing nothing (0018 §九 3 B).
  */
 export function feedClassifyFromTurn(turnId) {
   try {
