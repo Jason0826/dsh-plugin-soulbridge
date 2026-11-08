@@ -116,6 +116,7 @@ test('index answers apply as indexes; an empty or stale answer is skipped, never
     { id: 'fc_rule', statement: '已分好的规则', reason: '索引', kind: 'index' },
     { id: 'fc_stale', statement: '已退场的规则', reason: '索引', kind: 'index' },
     { id: 'fc_empty', statement: '没拿到索引的规则', reason: '索引', kind: 'index' },
+    { id: 'fc_prefix', statement: '模型没照前缀答的规则', reason: '索引', kind: 'index' },
     { id: 'fc_new', statement: '新候选', reason: '全收' },
   ];
   const counts = applyClassifications(
@@ -123,6 +124,10 @@ test('index answers apply as indexes; an empty or stale answer is skipped, never
       { id: 'fc_rule', kind: 'index', index: '改 JSON 别用字符串替换' },
       { id: 'fc_stale', kind: 'index', index: '这条写不进去' },
       { id: 'fc_empty', kind: 'index' },
+      // The model ignored the 「规则|」 prefix and re-classified a placed rule. The
+      // placement must survive: no markRule, counted as a skipped index line, so the
+      // first batch shows indexSkipped>0 instead of stacking a second 触发 slot.
+      { id: 'fc_prefix', kind: 'rule', trigger: '{"any":["json"]}', action: '重新分类' },
       { id: 'fc_new', kind: 'rule', trigger: '{"any":["json"]}', action: '用 edit 工具', index: '改 JSON' },
       // Not in the batch: a hallucinated id is ignored, not written.
       { id: 'fc_hallucinated', kind: 'index', index: '不在批次里' },
@@ -138,7 +143,7 @@ test('index answers apply as indexes; an empty or stale answer is skipped, never
     ['rule', 'fc_new', { trigger: '{"any":["json"]}', action: '用 edit 工具', index: '改 JSON' }],
   ]);
   // Skipped is not pending: 待修 would demote a rule that is already in use.
-  assert.deepEqual(counts, { rules: 1, profiles: 0, pending: 0, indexed: 1, indexSkipped: 2 });
+  assert.deepEqual(counts, { rules: 1, profiles: 0, pending: 0, indexed: 1, indexSkipped: 3 });
 });
 
 test('wiring: the two measured tools write a countable event', () => {

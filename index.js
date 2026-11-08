@@ -2783,10 +2783,11 @@ export function backfillClassifyFromCorrection(correction) {
  * reason this routing is a separate function instead of living inside the async step.
  */
 export function applyClassifications(classified, batch, soul) {
-  const known = new Set(batch.map((item) => item.id));
+  const known = new Map(batch.map((item) => [item.id, item]));
   const counts = { rules: 0, profiles: 0, pending: 0, indexed: 0, indexSkipped: 0 };
   for (const item of classified) {
-    if (!known.has(item.id)) continue;
+    const entry = known.get(item.id);
+    if (!entry) continue;
     if (item.kind === 'index') {
       // A rule that is no longer an active rule (retired, re-roled) is skipped, not
       // demoted: writing the line elsewhere would put a parked item in the directory.
@@ -2795,6 +2796,14 @@ export function applyClassifications(classified, batch, soul) {
         counts.indexSkipped += 1;
         log(`classify: index skipped ${item.id} (${item.index ? 'not an active rule' : 'empty line'})`);
       }
+    } else if (entry.kind === 'index') {
+      // The batch said this row is already placed and only owes a catalog line. An
+      // answer that classifies it again would rewrite a trigger nobody asked about
+      // (addSlots would stack a second 触发 slot) — ignore it and count the miss, so a
+      // model that ignores the prefix shows up as `index-skipped=10` on the first batch
+      // instead of quietly corrupting the rule layer.
+      counts.indexSkipped += 1;
+      log(`classify: index item answered as ${item.kind} — ignored (${item.id})`);
     } else if (item.kind === 'rule' && item.trigger) {
       soul.markRule(item.id, { trigger: item.trigger, action: item.action, index: item.index });
       counts.rules += 1;
@@ -2803,10 +2812,9 @@ export function applyClassifications(classified, batch, soul) {
       // The classification is the only moment the dimension is known, so the merge
       // queue is fed here. Without this the merge stage had no live input at all and
       // only ever ran from a hand-seeded queue.
-      const source = batch.find((entry) => entry.id === item.id);
       enqueueProfileCandidate({
         id: item.id,
-        statement: source?.statement ?? '',
+        statement: entry.statement ?? '',
         dimension: item.dimension ?? '',
       });
       counts.profiles += 1;
