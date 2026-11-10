@@ -1707,11 +1707,25 @@ const EXTRACT_QUEUE_FILE = join(HOME, 'pending-extract.json');
 const EXTRACT_MAX_ATTEMPTS = 3;
 
 /* 0028 决定 2: the departure checklist, declared once (rule 6).
- * The two size bounds and the age bound are ENGINEERING fallbacks — they flush a
- * buffer that would otherwise dangle, never a claim that a topic ended. All three
- * are test inputs to planSegment, not scattered literals. */
+ * The size bounds, the stale bound and the age bound are ENGINEERING fallbacks —
+ * they flush a buffer that would otherwise dangle, never a claim that a topic
+ * ended. All of them are test inputs to planSegment, not scattered literals.
+ *
+ * `SEGMENT_STALE_*` is the row added on 2026-11-10 for starvation: the other four
+ * rows all wait on the host (compress / switch / archive) or on a size a design
+ * discussion never reaches, so an afternoon of turns sat unextracted with
+ * attempts:0 and 判据 1 took the hit. It is NOT 0028 §4's rejected "静默 30 分钟 =
+ * 话题结束" — that number is reused for a different judgement: this one never
+ * says the topic ended, only that the buffer is old and fat enough to land. The
+ * harm it can do is splitting one topic across two segments, which the thread
+ * candidates and fallback-previous already stitch; the harm it removes is facts
+ * sitting outside the DB until the user stops working. */
 export const SEGMENT_MAX_TURNS = 40;
 export const SEGMENT_MAX_CHARS = 60_000;
+/** Material floor for the stale row: below this the buffer is too thin to pay a call. */
+export const SEGMENT_STALE_MIN_TURNS = 10;
+/** How old a fat-enough buffer may get before it lands (half-open, like the age bound). */
+export const SEGMENT_STALE_AFTER_MS = 30 * 60 * 1000;
 export const SEGMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SEGMENT_STATE_FILE = join(HOME, 'segment-state.json');
 /** Seals are a marker, not work: the newest N prove "extracted at most once". */
@@ -1891,9 +1905,10 @@ function sealSegment({ trigger, turnIds, turns, chars, outcome, session }) {
  *     Contiguity keeps the run a stretch of conversation; taking the first run
  *     means a backfill batch appended behind live turns is not stranded behind
  *     them — live turns wait for their own departure, history flushes on its own.
- *   - an engineering fallback over the WHOLE buffer: over the size cap or older
- *     than a day. These flush what would otherwise dangle; they never assert a
- *     topic boundary (quiet-time: a time signal is only ever a fallback).
+ *   - an engineering fallback over the WHOLE buffer: over the size cap, or fat
+ *     enough and old enough, or older than a day. These flush what would otherwise
+ *     dangle; they never assert a topic boundary (quiet-time: a time signal is only
+ *     ever a fallback).
  *
  * Returns `{ entries, trigger }`; `trigger: null` means nothing has left yet.
  */
@@ -1905,6 +1920,8 @@ export function planSegment(entries, env = {}) {
     now = Date.now(),
     maxTurns = SEGMENT_MAX_TURNS,
     maxChars = SEGMENT_MAX_CHARS,
+    staleMinTurns = SEGMENT_STALE_MIN_TURNS,
+    staleAfterMs = SEGMENT_STALE_AFTER_MS,
     maxAgeMs = SEGMENT_MAX_AGE_MS,
   } = env;
   if (!Array.isArray(entries) || entries.length === 0) return { entries: [], trigger: null };
@@ -1925,6 +1942,10 @@ export function planSegment(entries, env = {}) {
   const chars = entries.reduce((sum, entry) => sum + (entry.chars ?? 0), 0);
   if (entries.length >= maxTurns || chars >= maxChars) return { entries, trigger: 'capacity' };
   const oldest = Math.min(...entries.map((entry) => entry.startedAt ?? now));
+  // Order matters for the label only (all three flush the whole buffer), and this
+  // order reads as the narrowest bound first: size, then material+staleness, then
+  // whatever is still dangling after a day however thin it is.
+  if (entries.length >= staleMinTurns && now - oldest > staleAfterMs) return { entries, trigger: 'stale' };
   if (now - oldest > maxAgeMs) return { entries, trigger: 'age' };
   return { entries: [], trigger: null };
 }

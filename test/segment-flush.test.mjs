@@ -122,6 +122,35 @@ test('checklist: capacity by characters — 60k flushes, just under waits', () =
   );
 });
 
+test('checklist: enough material and stale — 10 turns past 30 min go, 9 turns or 29 min wait', () => {
+  // The starvation this bounds (2026-11-10): the other four rows ask the host for a
+  // departure (compress / switch / archive) or a size nobody reaches in an evening's
+  // discussion, so a whole afternoon sat in the queue with attempts:0 and 判据 1
+  // ("不用重复说") took the hit. This row asserts no topic boundary — it only says
+  // "the buffer is old and fat enough, land it" (0028 §5 修订 2026-11-10).
+  const now = 10_000_000_000;
+  const old = now - mod.SEGMENT_STALE_AFTER_MS - 1;
+  const turns = (n, startedAt) => Array.from({ length: n }, (_, i) => entry(`t${i}`, { startedAt }));
+  assert.equal(
+    mod.planSegment(turns(10, old), { currentSessionId: 's1', now }).trigger,
+    'stale',
+    '10 轮且超 30 分钟 → 落地上一次',
+  );
+  assert.equal(
+    mod.planSegment(turns(9, old), { currentSessionId: 's1', now }).trigger,
+    null,
+    '9 轮太薄：不到材料下限就等（材料下限与容量上限是两个数）',
+  );
+  assert.equal(
+    mod.planSegment(turns(10, now - mod.SEGMENT_STALE_AFTER_MS), { currentSessionId: 's1', now }).trigger,
+    null,
+    '半开边界：恰好 30 分钟不算「超过」（与 24h 年龄同一口径）',
+  );
+  // The whole buffer leaves, never a prefix: a fatter unit is not a licence to split
+  // it (rule 17) — 39 turns at 31 min is one segment, not 10 + 29.
+  assert.equal(mod.planSegment(turns(39, old), { currentSessionId: 's1', now }).entries.length, 39);
+});
+
 test('checklist: age flushes past 24h; exactly 24h is not "over"', () => {
   const now = 10_000_000_000;
   const edge = now - mod.SEGMENT_MAX_AGE_MS;
