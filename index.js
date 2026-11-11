@@ -2019,7 +2019,11 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
     // The context carries both halves of continuity (ADR 0034): the candidates' last
     // lines, and the previous user line — the unit is a segment, so without them the
     // model cannot tell "继续" from a new subject.
-    const context = soul.extractionContext(20, { turnNo, sessionId: turnRow?.sessionId });
+    // The unit text is what the candidate set is chosen against: `<known-facts>` is
+    // there to answer "is this already known", so the pool is the facts about the
+    // things this text names, not the newest rows (core index.ts
+    // extractionFactCandidates). Without the text the tiers collapse to the floor.
+    const context = soul.extractionContext(20, { turnNo, sessionId: turnRow?.sessionId, text });
     // "The previous turn belonged to this thread" is the cheapest continuity hint
     // there is: in most cases the answer is simply "the same one again".
     if (turnRow) {
@@ -2072,6 +2076,15 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
     // Provenance is observable (ADR 0035): the fact count alone cannot tell whether
     // anything came from my side of the exchange.
     const inferred = result.facts.filter((fact) => fact.source === 'inferred').length;
+    // The candidate pool is a judgement input, so its size and its losses belong in the
+    // same line as the fact count: "17 facts written, pool 30 from entity/thread" and
+    // "17 facts written, pool 12 all floor, 3 groups dropped" are different situations
+    // that used to look identical.
+    const pool = context.factCandidates;
+    const poolLine = pool
+      ? ` pool=${pool.chosen}(${pool.chars}ch e${pool.byTier.entity}/t${pool.byTier.thread}/s${pool.byTier.similar}/r${pool.byTier.recent})` +
+        ` poolDropped=${pool.droppedGroups.length}${pool.droppedGroups.length ? `:${pool.droppedGroups.map((d) => d.group).slice(0, 3).join(',')}` : ''}`
+      : '';
     // "done", not "ok": the caller decides the queue outcome next (rules:model-failed
     // is NOT ok), and the old prefix read as success in every log review.
     log(
@@ -2084,7 +2097,8 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
         ` thread=${threadIds.join(',')}` +
           `${createdNew > 0 ? (threadIds.length === 1 ? '(new)' : `(${createdNew} new)`) : ''}` +
           ` join=${joins} threadLine=${draft.threadLine ?? 'rules'}` +
-          `${applied.some((entry) => entry.topicUpdated) ? ' topic=updated' : ''}`,
+          `${applied.some((entry) => entry.topicUpdated) ? ' topic=updated' : ''}` +
+          poolLine,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -2110,6 +2124,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
       draftSkipped: (draft.skipped ?? []).slice(0, 5),
       droppedSlots: result.droppedSlots,
       holderFallbacks: result.holderFallbacks,
+      ...(pool ? { factPool: pool } : {}),
       thread: attribution.threadId,
       threadCreated: attribution.created,
       threadTopic: attribution.topic,
