@@ -3502,6 +3502,17 @@ function rememberTool() {
   };
 }
 
+/**
+ * Drop keys whose value is `undefined` before a value crosses the tool boundary.
+ *
+ * The harness snapshots tool results as lossless JSON: an own key holding
+ * `undefined` has no JSON form, so the whole result is rejected with
+ * `value is not lossless JSON`. An absent key is valid JSON; `undefined` is not.
+ */
+function omitUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+}
+
 function detailTool() {
   return {
     name: 'soul_detail',
@@ -3544,7 +3555,10 @@ function detailTool() {
         }
         log(`tool soul_detail: ${id} turn=${detail.turn ? 'yes' : 'no'}`);
         trace({ event: 'tool-call', name: 'soul_detail', hit: true, id, hasTurn: Boolean(detail.turn) });
-        return {
+        // A fact without valid_from_text (a date() epoch) or without a source
+        // turn carries `undefined` in these fields — omit them instead of
+        // handing the harness keys it must reject (state.md 2026-11-11 22:15).
+        return omitUndefined({
           ok: true,
           statement: detail.fact.statement,
           validFrom: detail.fact.validFrom,
@@ -3552,7 +3566,7 @@ function detailTool() {
           validTo: detail.fact.validTo,
           userText: detail.turn?.userText,
           assistantText: detail.turn?.assistantText,
-        };
+        });
       } catch (error) {
         return { ok: false, reason: error instanceof Error ? error.message : String(error) };
       }
