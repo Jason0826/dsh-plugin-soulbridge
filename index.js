@@ -2085,6 +2085,12 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
       ? ` pool=${pool.chosen}(${pool.chars}ch e${pool.byTier.entity}/t${pool.byTier.thread}/s${pool.byTier.similar}/r${pool.byTier.recent})` +
         ` poolDropped=${pool.droppedGroups.length}${pool.droppedGroups.length ? `:${pool.droppedGroups.map((d) => d.group).slice(0, 3).join(',')}` : ''}`
       : '';
+    // The merge decision is the other half of the pool: `pool=` says what the model
+    // could see, `action=` says what it did with it. Without this line a thin pool
+    // and a pool with nothing to merge look identical (judgement 3). Absent when the
+    // installed core predates the counter — same contract as factPool.
+    const acts = result.actions;
+    const actionLine = acts ? ` action=add${acts.add}/sup${acts.supersede}/upd${acts.update}/noop${acts.noop}` : '';
     // "done", not "ok": the caller decides the queue outcome next (rules:model-failed
     // is NOT ok), and the old prefix read as success in every log review.
     log(
@@ -2098,7 +2104,8 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
           `${createdNew > 0 ? (threadIds.length === 1 ? '(new)' : `(${createdNew} new)`) : ''}` +
           ` join=${joins} threadLine=${draft.threadLine ?? 'rules'}` +
           `${applied.some((entry) => entry.topicUpdated) ? ' topic=updated' : ''}` +
-          poolLine,
+          poolLine +
+          actionLine,
     );
     for (const skipped of result.skipped.slice(0, 3)) {
       log(`  extract skipped: ${skipped.what} (${skipped.reason})`);
@@ -2125,6 +2132,7 @@ async function runExtraction(text, turnId, turnNo, origin = 'live', unit) {
       droppedSlots: result.droppedSlots,
       holderFallbacks: result.holderFallbacks,
       ...(pool ? { factPool: pool } : {}),
+      ...(acts ? { actions: acts } : {}),
       thread: attribution.threadId,
       threadCreated: attribution.created,
       threadTopic: attribution.topic,

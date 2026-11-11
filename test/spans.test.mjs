@@ -110,9 +110,13 @@ test('spans end to end: two 线索 lines → two threads, every turn attached', 
   const line = log().split(/\r?\n/).find((row) => row.includes('extract done:'));
   assert.match(line, /unit=3turns/);
   assert.match(line, /thread=th_\w+,th_\w+\(2 new\) join=explicit-new\+continue threadLine=present/);
+  // The model answered 无: nothing to store is a decision too, so it counts as a
+  // noop — "pool had nothing to merge" must not log like "pool was never seen".
+  assert.match(line, /action=add0\/sup0\/upd0\/noop1/);
 
   const extract = trace().filter((row) => row.event === 'extract').at(-1);
   assert.equal(extract.threadSpans.length, 3, '拆段的逐轮归属进 trace，错切才可诊断');
+  assert.deepEqual(extract.actions, { add: 0, supersede: 0, update: 0, noop: 1 }, '动作计数进 trace');
   assert.deepEqual(
     extract.threadSpans.map((span) => span.span),
     [1, 2, 3],
@@ -138,6 +142,30 @@ test('spans end to end: rules mode keeps the old single-thread log line', async 
   // chains on turns 2–3 used to report only the head's reason.
   assert.match(line, /thread=th_\w+\(new\) join=[a-z-]+(\+[a-z-]+)* threadLine=rules/);
   assert.equal(line.includes(','), false, '单线索不长出列表');
+});
+
+test('actions end to end: a written fact counts as add, not as silence', async () => {
+  writeFileSync(join(home, 'plugin-config.json'), JSON.stringify({ extract: 'llm', provider: 'test', model: 'test' }), 'utf8');
+  const answer = '事实: 小林今天很开心 | 心情 | 2026-11-11 |  | told | 0.8';
+  const harness = fakeCtx(answer);
+  mod.apply(harness.ctx);
+  seed();
+
+  await mod.drainExtractionQueue({ sessionId: 'live', archivedSessions: ['live'] });
+  assert.equal(readQueue().length, 0);
+
+  const line = log()
+    .split(/\r?\n/)
+    .filter((row) => row.includes('extract done:'))
+    .at(-1);
+  assert.match(line, /facts=1/);
+  assert.match(line, /action=add1\/sup0\/upd0\/noop0/, '写了一条 = 一次 add，计数必须落在日志上');
+
+  const extract = trace().filter((row) => row.event === 'extract').at(-1);
+  assert.deepEqual(extract.actions, { add: 1, supersede: 0, update: 0, noop: 0 });
+  // Backward contract: an installed core without the counter omits the field
+  // instead of crashing (same rule as factPool).
+  assert.equal(typeof extract.actions.noop, 'number');
 });
 
 test.after(() => {
